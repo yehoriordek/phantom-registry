@@ -1,0 +1,1559 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#12131a">
+<title>Реєстр пацієнтів v4</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body,#root{height:100%;width:100%;overflow:hidden}
+body{background:#12131a;color:#e8e9ed;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;font-size:14px;-webkit-font-smoothing:antialiased}
+input,textarea,button,select{font-family:inherit;font-size:inherit}
+::-webkit-scrollbar{width:3px}::-webkit-scrollbar-thumb{background:#333;border-radius:3px}
+input[type="range"]{-webkit-appearance:none;appearance:none;height:6px;border-radius:3px;outline:none;cursor:pointer}
+input[type="range"]::-webkit-slider-thumb{-webkit-appearance:none;width:22px;height:22px;border-radius:50%;background:#c8a2ff;cursor:pointer;border:2px solid #12131a}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
+<script src="https://unpkg.com/docx@8.5.0/build/index.umd.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/FileSaver.js/2.0.5/FileSaver.min.js"></script>
+<script src="https://accounts.google.com/gsi/client" async defer></script>
+<script>
+// ═══ GOOGLE DRIVE SYNC ═══
+const GDRIVE = {
+  CLIENT_ID: '23505544097-vfe1ie75bsoq7aqv05io5nn1l3dla19j.apps.googleusercontent.com',
+  SCOPE: 'https://www.googleapis.com/auth/drive.file',
+  FILE_NAME: 'phantom_registry_db.json',
+  token: null,
+  fileId: null,
+  syncing: false,
+  onStatusChange: null,
+
+  async init() {
+    // Try to restore token from sessionStorage
+    const saved = sessionStorage.getItem('gdrive_token');
+    if (saved) {
+      const t = JSON.parse(saved);
+      if (t.expires > Date.now()) {
+        this.token = t.access_token;
+        return true;
+      }
+    }
+    return false;
+  },
+
+  login() {
+    return new Promise((resolve) => {
+      const client = google.accounts.oauth2.initTokenClient({
+        client_id: this.CLIENT_ID,
+        scope: this.SCOPE,
+        callback: (resp) => {
+          if (resp.error) { resolve(false); return; }
+          this.token = resp.access_token;
+          sessionStorage.setItem('gdrive_token', JSON.stringify({
+            access_token: resp.access_token,
+            expires: Date.now() + (resp.expires_in - 60) * 1000
+          }));
+          resolve(true);
+        }
+      });
+      client.requestAccessToken();
+    });
+  },
+
+  async findFile() {
+    const r = await fetch(
+      `https://www.googleapis.com/drive/v3/files?q=name='${this.FILE_NAME}'+and+trashed=false&spaces=drive&fields=files(id,name,modifiedTime)`,
+      { headers: { Authorization: `Bearer ${this.token}` } }
+    );
+    const d = await r.json();
+    if (d.files && d.files.length > 0) {
+      this.fileId = d.files[0].id;
+      return true;
+    }
+    return false;
+  },
+
+  async readDB() {
+    if (!this.token) return null;
+    const found = await this.findFile();
+    if (!found) return null;
+    const r = await fetch(
+      `https://www.googleapis.com/drive/v3/files/${this.fileId}?alt=media`,
+      { headers: { Authorization: `Bearer ${this.token}` } }
+    );
+    if (!r.ok) return null;
+    return await r.json();
+  },
+
+  async writeDB(data) {
+    if (!this.token || this.syncing) return;
+    this.syncing = true;
+    if (this.onStatusChange) this.onStatusChange('syncing');
+    try {
+      const body = JSON.stringify(data);
+      const blob = new Blob([body], { type: 'application/json' });
+      if (!this.fileId) await this.findFile();
+
+      if (this.fileId) {
+        // Update existing
+        await fetch(
+          `https://www.googleapis.com/upload/drive/v3/files/${this.fileId}?uploadType=media`,
+          { method: 'PATCH', headers: { Authorization: `Bearer ${this.token}`, 'Content-Type': 'application/json' }, body }
+        );
+      } else {
+        // Create new
+        const meta = JSON.stringify({ name: this.FILE_NAME, mimeType: 'application/json' });
+        const form = new FormData();
+        form.append('metadata', new Blob([meta], { type: 'application/json' }));
+        form.append('file', blob);
+        const r = await fetch(
+          'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id',
+          { method: 'POST', headers: { Authorization: `Bearer ${this.token}` }, body: form }
+        );
+        const d = await r.json();
+        this.fileId = d.id;
+      }
+      if (this.onStatusChange) this.onStatusChange('saved');
+    } catch(e) {
+      console.error('Drive write error:', e);
+      if (this.onStatusChange) this.onStatusChange('error');
+    } finally {
+      this.syncing = false;
+    }
+  }
+};
+</script>
+<script type="text/babel">
+const {useState,useEffect,useMemo,useRef}=React;
+
+// ═══ DB ═══
+const DB="AmputeeRegistry",VER=6;
+function openDB(){return new Promise((res,rej)=>{const r=indexedDB.open(DB,VER);r.onupgradeneeded=e=>{const db=e.target.result;if(!db.objectStoreNames.contains("patients"))db.createObjectStore("patients",{keyPath:"id"});if(!db.objectStoreNames.contains("assessments")){const s=db.createObjectStore("assessments",{keyPath:"id"});s.createIndex("pid","pid")}if(!db.objectStoreNames.contains("tfb_sessions")){const s=db.createObjectStore("tfb_sessions",{keyPath:"id"});s.createIndex("pid","pid")}};r.onsuccess=()=>res(r.result);r.onerror=()=>rej(r.error)})}
+async function dbAll(s){const db=await openDB();return new Promise((r,j)=>{const t=db.transaction(s,"readonly");const q=t.objectStore(s).getAll();q.onsuccess=()=>r(q.result);q.onerror=()=>j(q.error)})}
+async function dbPut(s,d){const db=await openDB();return new Promise((r,j)=>{const t=db.transaction(s,"readwrite");t.objectStore(s).put(d);t.oncomplete=()=>r();t.onerror=()=>j(t.error)})}
+async function dbDel(s,id){const db=await openDB();return new Promise((r,j)=>{const t=db.transaction(s,"readwrite");t.objectStore(s).delete(id);t.oncomplete=()=>r();t.onerror=()=>j(t.error)})}
+const uid=()=>Date.now().toString(36)+Math.random().toString(36).slice(2);
+
+// ═══ AMPUTATION LEVELS ═══
+const LIMBS={
+LUE:{name:"Ліва верхня кінцівка",short:"ЛВК",levels:[
+{id:"forequarter",name:"Міжлопатково-грудна (forequarter)",sub:null},
+{id:"shoulder_dis",name:"Екзартикуляція плечового суглоба",sub:null},
+{id:"transhumeral",name:"Трансгумеральна (плече)",sub:["в/3","1/2","н/3"]},
+{id:"elbow_dis",name:"Екзартикуляція ліктьового суглоба",sub:null},
+{id:"transradial",name:"Трансрадіальна (передпліччя)",sub:["в/3","1/2","н/3"]},
+{id:"wrist_dis",name:"Екзартикуляція зап'ясткового суглоба",sub:null},
+{id:"transcarpal",name:"Транскарпальна (кисть)",sub:null},
+{id:"transmetacarpal",name:"Трансметакарпальна",sub:null},
+{id:"transphalangeal",name:"Трансфалангова (пальці)",sub:null},
+]},
+RUE:{name:"Права верхня кінцівка",short:"ПВК",levels:[
+{id:"forequarter",name:"Міжлопатково-грудна (forequarter)",sub:null},
+{id:"shoulder_dis",name:"Екзартикуляція плечового суглоба",sub:null},
+{id:"transhumeral",name:"Трансгумеральна (плече)",sub:["в/3","1/2","н/3"]},
+{id:"elbow_dis",name:"Екзартикуляція ліктьового суглоба",sub:null},
+{id:"transradial",name:"Трансрадіальна (передпліччя)",sub:["в/3","1/2","н/3"]},
+{id:"wrist_dis",name:"Екзартикуляція зап'ясткового суглоба",sub:null},
+{id:"transcarpal",name:"Транскарпальна (кисть)",sub:null},
+{id:"transmetacarpal",name:"Трансметакарпальна",sub:null},
+{id:"transphalangeal",name:"Трансфалангова (пальці)",sub:null},
+]},
+LLE:{name:"Ліва нижня кінцівка",short:"ЛНК",levels:[
+{id:"hemipelvectomy",name:"Гемiпельвектомія",sub:null},
+{id:"hip_dis",name:"Екзартикуляція кульшового суглоба",sub:null},
+{id:"transfemoral",name:"Трансфеморальна (стегно)",sub:["в/3","1/2","н/3"]},
+{id:"knee_dis",name:"Екзартикуляція колінного суглоба",sub:null},
+{id:"transtibial",name:"Транстибіальна (гомілка)",sub:["в/3","1/2","н/3"]},
+{id:"ankle_dis",name:"Екзартикуляція гомілковостопного (Syme)",sub:null},
+{id:"chopart",name:"За Шопаром (Chopart)",sub:null},
+{id:"lisfranc",name:"За Лісфранком (Lisfranc)",sub:null},
+{id:"transmetatarsal",name:"Трансметатарзальна",sub:null},
+{id:"ray",name:"Променева (Ray)",sub:null},
+{id:"toe",name:"Ампутація пальця(ів) стопи",sub:null},
+]},
+RLE:{name:"Права нижня кінцівка",short:"ПНК",levels:[
+{id:"hemipelvectomy",name:"Гемiпельвектомія",sub:null},
+{id:"hip_dis",name:"Екзартикуляція кульшового суглоба",sub:null},
+{id:"transfemoral",name:"Трансфеморальна (стегно)",sub:["в/3","1/2","н/3"]},
+{id:"knee_dis",name:"Екзартикуляція колінного суглоба",sub:null},
+{id:"transtibial",name:"Транстибіальна (гомілка)",sub:["в/3","1/2","н/3"]},
+{id:"ankle_dis",name:"Екзартикуляція гомілковостопного (Syme)",sub:null},
+{id:"chopart",name:"За Шопаром (Chopart)",sub:null},
+{id:"lisfranc",name:"За Лісфранком (Lisfranc)",sub:null},
+{id:"transmetatarsal",name:"Трансметатарзальна",sub:null},
+{id:"ray",name:"Променева (Ray)",sub:null},
+{id:"toe",name:"Ампутація пальця(ів) стопи",sub:null},
+]},
+};
+
+// ═══ GENESIS DESCRIPTORS ═══
+const GENESIS={
+peripheral:{name:"Периферичний генез",color:"#f4a261",
+desc:["Біль при дотику","Механ. чинники","Запалення","Температура","Закреп.","Ріжучий","Тупий","Гострий","Пронизуючий","Спазмуючий","Прострілюючий","Пекучий","Колючий","Тягнучий","Ниючий","Болісні судоми ф.к.","Розпирання ф.к.","Пульсуючий","Тиснучий","Розряди струмом","Всверлювання","Контрактура ф.к."]},
+cerebral:{name:"Церебральний генез",color:"#64b5f6",
+desc:["Оніміння","Поколювання","Мурашки","Тепло","Тонус","Відчуття предметів","Мокро","Сухо","Твердо","М'якість","Стискання","Згинання","Вітерець по ф.к.","Скручування пальців","Важкість ф.к.","Телескопія","Бажання скористатись ф.к.","Контрактура ф.к.","Можливість рухати ф.к.","Можливість відчувати ф.к."]},
+spinal:{name:"Спінальний генез",color:"#2a9d8f",
+desc:["Прострілюючий біль від кукси до поясниці/шиї","Посилення болю при заспокоюючих вправах","Судоми по тілу","Наростання болю при повторних стимулах"]},
+psychogenic:{name:"Психогенний генез",subtitle:"Біль/відчуття викликаються спогадами, емоціями про:",color:"#e9c46a",
+desc:["Вибух міни","Біль від кулі/уламка","Хірургічне втручання","Відчуття годинника на руці","Страх/відраза від вигляду ампутації","Спогади про запах","Біль від спогадів про евакуацію","Кошмари про амп. кінцівку","Посилення від емоцій страху","Посилення від емоцій гніву","Посилення від емоцій суму"]},
+};
+
+// ═══ TESTS & REACTIONS ═══
+const CEREBRAL_TESTS=["Контрлат.тест (дзеркало)","Контрлат.тест (муляж)","Контрлат.тест (стимул. інтакт. кінцівки)","Тест моторної уяви","Хватальний рефлекс","Рефлекс захисту","Пальце-носова проба","Телескопія гумкою","Телескопія панчохою","Телескопія муляжем","Мозочковий тест"];
+const PERIPHERAL_TESTS=["Мобілізація шва","МФТ з мобіл. шва","Компресія в тригерних точках","Тест компресії тазу","Тест МФ ланцюгів (передній)","Тест МФ ланцюгів (задній)","Тест МФ ланцюгів (діагональний)","Контрлат.тест патерну крока","Тракція м'язів кукси","Тест пензликом","Переривання сенс. потоку","Біль при дефекації/сечоспусканні"];
+const PSYCHOGENIC_TESTS=["Флеш-тест (спалахом)","Тест тілесного відреагування болю","Відволікання","Когнітивне навантаження"];
+const REACTIONS=["ФБ зменшився","ФБ збільшився","ФБ зник","ФБ появився","ФВ зменшились","ФВ збільшились","ФВ зникли","ФВ появились","Телескопія","Зворотня телескопія","Немає реакції"];
+
+// ═══ Other constants ═══
+const PAIN_FLOW=["Фон.+мін.зміни","Фон.+приступи","Відс.+приступи","Приступи+фон"];
+const STUMP_PATH=["Уламки в куксі (інкапсульовані)","Кісткові уламки","Неврома","Остеофіти","Вростання нерву в рубець","Адгезія нерву","Рубцева контрактура","Гетеротопічна осифікація","Запалення/інфекція кукси","Погано сформована кукса"];
+const SOM_REACT=["Серцебиття","Задишка","ПА","Нудота","Жар","Холод","Спрага","Пітливість","Відсутні"];
+const EXP_OPT=["Участь у бойових діях","Полон","Тортури","Втрата","Невизначена втрата","Ампутація","Невиліковна хвороба","Розлади мотивації","БАР","Депресивні","Тривожні","Стрес/Травма","РХП","Органічні","Інтерперсон. складн.","Сімейні стосунки","Кризова","Суїцидальна","Когнітивна","Конверсійний синдром","Позит. психіатр. симпт."];
+const SYM_OPT=["Депресія","ГСР","РА","БАР","ПТСР","КПТСР","ГТР","ДКР","ОКР","Панічний розлад","Соц. фобія","Відносини","Органіка","Розлад сну","Фантомний біль","Фантомні відчуття","Адикції (алко)","Адикції (нарко)","Адикції (ігрова)","Горювання","Розлад регул. злості","лЗЧМТ","Когнітивні функції","Інше"];
+const THERAPY=["EMDR","BRAINSPOTTING","DBT","CBT","Терапія фантомного болю","Контейнування","Психоедукація"];
+
+// ═══ Questionnaires ═══
+const PCL5Q=["Повторювані, хвилюючі та небажані спогади стресового досвіду?","Повторювані, хвилюючі сновидіння про стресовий досвід?","Раптове почуття, ніби стресовий досвід знову трапляється?","Почуття засмученості при нагадуванні про стресовий досвід?","Сильні фізичні реакції при нагадуванні про стресовий досвід?","Уникання спогадів, думок або почуттів, пов'язаних зі стресовим досвідом?","Уникання зовнішніх стимулів, що нагадують про стресовий досвід?","Проблеми згадування важливих моментів стресового досвіду?","Сильні негативні переконання про себе, інших або світ?","Самозвинувачення або звинувачення інших щодо стресового досвіду?","Сильні негативні емоції: страх, жах, злість, провина, сором?","Втрата інтересу до діяльності, що раніше приносила задоволення?","Відчуття віддаленості або відокремленості від інших?","Проблеми у переживанні позитивних емоцій?","Роздратування, спалахи гніву, агресивна поведінка?","Ризикована поведінка або дії, що можуть зашкодити?","Бути «на взводі» або «на сторожі»?","Відчуття постійної напруги?","Труднощі із зосередженістю?","Проблеми із засинанням або нічні прокидання?"];
+const PCL5OPT=["Зовсім ні","Трохи","Помірно","Відчутно","Дуже"];
+const HADS=[
+{s:"Т",q:"Я відчуваю напруженість, мені не по собі",o:["Весь час","Часто","Час від часу, іноді","Зовсім не відчуваю"],sc:[3,2,1,0]},
+{s:"Д",q:"Те, що раніше приносило задоволення, і зараз викликає таке ж почуття",o:["Це так","Напевно, це так","В дуже малій мірі","Це зовсім не так"],sc:[0,1,2,3]},
+{s:"Т",q:"Я відчуваю страх, здається, ніби щось жахливе може статися",o:["Безумовно, страх сильний","Так, але страх не сильний","Іноді, але не турбує","Зовсім не відчуваю"],sc:[3,2,1,0]},
+{s:"Д",q:"Я здатний розсміятися і побачити смішне",o:["Безумовно так","Напевно, так","Лише в малому ступені","Зовсім не здатний"],sc:[0,1,2,3]},
+{s:"Т",q:"Неспокійні думки крутяться в голові",o:["Постійно","Велику частину часу","Час від часу","Тільки іноді"],sc:[3,2,1,0]},
+{s:"Д",q:"Я відчуваю бадьорість",o:["Зовсім ні","Дуже рідко","Іноді","Практично весь час"],sc:[3,2,1,0]},
+{s:"Т",q:"Я легко можу сісти і розслабитися",o:["Безумовно так","Напевно, так","Лише зрідка","Зовсім не можу"],sc:[0,1,2,3]},
+{s:"Д",q:"Мені здається, що я все роблю повільно",o:["Практично весь час","Часто","Іноді","Зовсім ні"],sc:[3,2,1,0]},
+{s:"Т",q:"Я відчуваю внутрішнє напруження або тремтіння",o:["Зовсім ні","Іноді","Часто","Дуже часто"],sc:[0,1,2,3]},
+{s:"Д",q:"Я не стежу за своєю зовнішністю",o:["Безумовно так","Не приділяю достатньо часу","Може менше уваги","Стежу як раніше"],sc:[3,2,1,0]},
+{s:"Т",q:"Відчуваю непосидючість, потрібно рухатися",o:["Безумовно так","Напевно, так","Лише в деякій мірі","Зовсім ні"],sc:[3,2,1,0]},
+{s:"Д",q:"Мої справи можуть принести задоволення",o:["Як і зазвичай","Не в тій мірі","Значно менше","Зовсім ні"],sc:[0,1,2,3]},
+{s:"Т",q:"У мене буває раптове відчуття паніки",o:["Дуже часто","Досить часто","Не так часто","Зовсім ні"],sc:[3,2,1,0]},
+{s:"Д",q:"Можу отримати задоволення від книги, радіо, ТБ",o:["Часто","Іноді","Рідко","Дуже рідко"],sc:[0,1,2,3]},
+];
+const AIS=[
+{q:"Час засинання",o:["Дуже швидко","З невеликою затримкою","З помітною затримкою","Тривала затримка / не сплю"]},
+{q:"Пробудження вночі",o:["Ні","Рідко","Доволі часто","Часто / не сплю"]},
+{q:"Остаточне пробудження раніше",o:["Ні","Дещо раніше","Істотно раніше","Набагато раніше / не сплю"]},
+{q:"Загальна тривалість сну",o:["Достатньо","Недостатньо","Помітно недостатньо","Дуже недостатньо"]},
+{q:"Якість сну",o:["Задовільна","Трохи незадовільна","Погана","Дуже погана"]},
+{q:"Самопочуття наступного дня",o:["Нормальне","Трохи знижене","Помітно знижене","Дуже знижене"]},
+{q:"Працездатність наступного дня",o:["Нормальне","Трохи знижене","Помітно знижене","Дуже знижене"]},
+{q:"Денна сонливість",o:["Ні","Мало виражена","Суттєво виражена","Дуже сильно виражена"]},
+];
+const DN4Q=[
+{q:"Печіння",cat:"Опитування"},{q:"Відчуття холоду в болючій ділянці",cat:"Опитування"},{q:"Відчуття удару електричним струмом",cat:"Опитування"},
+{q:"Поколювання",cat:"Опитування"},{q:"Мурашки",cat:"Опитування"},{q:"Оніміння",cat:"Опитування"},{q:"Свербіж",cat:"Опитування"},
+{q:"Гіпоестезія при дотику",cat:"Огляд"},{q:"Гіпоестезія при уколі",cat:"Огляд"},{q:"Біль посилюється при проведенні пензлика",cat:"Огляд"},
+];
+
+// Interpreters
+const iPCL5=s=>s<=20?{t:"Норма",c:"#2a9d8f"}:s<=33?{t:"РА",c:"#e9c46a"}:{t:"ПТСР",c:"#e76f51"};
+const iHADS=(t,d)=>({t:t<=7?{t:"Норма",c:"#2a9d8f"}:t<=10?{t:"С/к трив.",c:"#e9c46a"}:{t:"Клін. трив.",c:"#e76f51"},d:d<=7?{t:"Норма",c:"#2a9d8f"}:d<=10?{t:"С/к деп.",c:"#e9c46a"}:{t:"Клін. деп.",c:"#e76f51"}});
+const iAIS=s=>s<=6?{t:"Норма",c:"#2a9d8f"}:{t:"Порушення",c:"#e76f51"};
+const iDN4=s=>s>=4?{t:"Нейропатичний біль",c:"#e76f51"}:{t:"Не нейропатичний",c:"#2a9d8f"};
+const iMoCA=s=>s>=26?{t:"Норма",c:"#2a9d8f"}:s>=18?{t:"Слабкі когніт. поруш.",c:"#e9c46a"}:s>=10?{t:"Помірні",c:"#f4a261"}:{t:"Важкі",c:"#e76f51"};
+const vc=v=>v<=2?"#2a9d8f":v<=4?"#8ab17d":v<=6?"#e9c46a":v<=8?"#f4a261":"#e76f51";
+
+// CSV
+function exportCSV(pts,asms){
+const h=["ПІП","Вік","Стать","В/Ч","Палата","Ампутації","RPNI","ФБ","ФВ","БК","ФБ VAS","ФВ VAS","БК VAS","Домін. генез","Перифер.","Церебр.","Спінал.","Психоген.","PCL-5","HADS-Т","HADS-Д","AIS","DN-4","MoCA","Заключення",
+"СФ_Активність","СФ_АктивністьЗміна","СФ_Ерекція","СФ_ЕрекціяТруднощі","СФ_Оргазм","СФ_ОргазмЗміна","СФ_ОргазмЛокалізація","СФ_ТілоЗони","СФ_ФантомСекс","СФ_ФантомОпис","СФ_БільПідЧасСексу","СФ_БільПосилення","СФ_БільПослаблення","СФ_Задоволеність","СФ_ОбразТіла","СФ_ФантомОргазмП","СФ_ФантомОргазмЛ","СФ_ФантомХарактерІнше","Згода_надана","Згода_дата"];
+const rows=pts.map(p=>{const la=asms.filter(a=>a.pid===p.id).sort((a,b)=>b.date>a.date?1:-1)[0];
+const ampStr=Object.entries(p.amps||{}).filter(([,v])=>v.level).map(([k,v])=>`${LIMBS[k]?.short}:${v.level}${v.sub?" "+v.sub:""}`).join("; ");
+const gc=calcGenesis(p);
+return[p.name,p.age,p.sex,p.unit,p.ward,ampStr,p.rpni?"Так":"Ні",p.hasFB?"Так":"Ні",p.hasFV?"Так":"Ні",p.hasBK?"Так":"Ні",p.fbVAS,p.fvVAS,p.bkVAS,gc.dominant,gc.peripheral,gc.cerebral,gc.spinal,gc.psychogenic,la?.pcl5??"",la?.hadsT??"",la?.hadsD??"",la?.ais??"",la?.dn4??"",p.moca||"",p.conclusion||"",
+p.sfRefuse?"ВІДМОВА":(p.sfActivity||""),p.sfActivityChange||"",p.sfErection||"",p.sfErectionDiff||"",p.sfOrgasm||"",p.sfOrgasmChange||"",(p.sfOrgasmLoc||[]).join("; "),(p.sfBodyZones||[]).join("; "),p.sfPhantomSex||"",(p.sfPhantomDesc||[]).join("; "),p.sfPainDuringSex||"",p.sfPainDuringSex==="Посилюється"?(p.sfPainIncrease??0):"",p.sfPainDuringSex==="Зменшується"?(p.sfPainDecrease??0):"",p.sfSatisfaction??"",p.sfBodyImage||"",p.sfDiscussed||"",(p.sfPhantomOrgasmR||[]).join("; "),(p.sfPhantomOrgasmL||[]).join("; "),p.sfPhantomDescOther||"",p.consentGiven?"Так":"Ні",p.consentDate||""]});
+const csv="\uFEFF"+[h,...rows].map(r=>r.map(c=>`"${String(c??"").replace(/"/g,'""')}"`).join(",")).join("\n");
+const b=new Blob([csv],{type:"text/csv;charset=utf-8;"});const u=URL.createObjectURL(b);const a=document.createElement("a");a.href=u;a.download=`registry_${new Date().toISOString().slice(0,10)}.csv`;a.click();URL.revokeObjectURL(u);
+}
+
+function calcGenesis(p){
+const counts={peripheral:(p.genPeripheral||[]).length,cerebral:(p.genCerebral||[]).length,spinal:(p.genSpinal||[]).length,psychogenic:(p.genPsychogenic||[]).length};
+const max=Math.max(...Object.values(counts));
+let dominant="—";
+if(max>0){const tops=Object.entries(counts).filter(([,v])=>v===max);
+if(tops.length===1){const names={peripheral:"Периферичний",cerebral:"Церебральний",spinal:"Спінальний",psychogenic:"Психогенний"};dominant=names[tops[0][0]];}
+else dominant="Змішаний";}
+return{...counts,dominant,total:Object.values(counts).reduce((a,b)=>a+b,0)};
+}
+
+// ═══ UI Primitives ═══
+const S={
+hdr:{padding:"14px 16px",display:"flex",alignItems:"center",gap:10,background:"rgba(18,19,26,0.97)",backdropFilter:"blur(12px)",position:"sticky",top:0,zIndex:100,borderBottom:"1px solid #1e2028"},
+card:{padding:"14px 16px",background:"#1a1c24",borderRadius:12,marginBottom:8,border:"1px solid #252830",cursor:"pointer"},
+inp:{width:"100%",padding:"10px 12px",background:"#1e2028",border:"1px solid #2e3038",borderRadius:8,color:"#e8e9ed",fontSize:14,outline:"none",boxSizing:"border-box"},
+lbl:{display:"block",fontSize:12,color:"#8a8f98",marginBottom:4,fontWeight:500,letterSpacing:.3},
+btn:{padding:"10px 20px",borderRadius:10,border:"none",fontSize:14,cursor:"pointer",display:"inline-flex",alignItems:"center",gap:8},
+chip:{padding:"6px 11px",borderRadius:20,border:"1px solid #3a3d45",background:"rgba(255,255,255,0.03)",color:"#9a9ea8",fontSize:12,cursor:"pointer"},
+chipA:{padding:"6px 11px",borderRadius:20,fontSize:12,cursor:"pointer",fontWeight:600},
+tab:{padding:"6px 12px",borderRadius:8,border:"none",whiteSpace:"nowrap",fontSize:12,cursor:"pointer"},
+};
+function Inp({label,...p}){return <div style={{marginBottom:14}}>{label&&<label style={S.lbl}>{label}</label>}<input {...p} style={{...S.inp,...(p.style||{})}} onFocus={e=>e.target.style.borderColor="#c8a2ff"} onBlur={e=>e.target.style.borderColor="#2e3038"}/></div>}
+function TArea({label,...p}){return <div style={{marginBottom:14}}>{label&&<label style={S.lbl}>{label}</label>}<textarea {...p} style={{...S.inp,minHeight:70,resize:"vertical",fontFamily:"inherit",...(p.style||{})}}/></div>}
+function Btn({children,v="p",...p}){const st=v==="p"?{background:"#c8a2ff",color:"#12131a",fontWeight:700}:v==="s"?{background:"rgba(200,162,255,0.12)",color:"#c8a2ff",fontWeight:600}:v==="d"?{background:"rgba(231,111,81,0.15)",color:"#e76f51",fontWeight:600}:{background:"transparent",color:"#9a9ea8"};return <button {...p} style={{...S.btn,...st,...(p.style||{})}}>{children}</button>}
+function Chips({opts,sel=[],onChange,multi=true,color="#c8a2ff"}){return <div style={{display:"flex",flexWrap:"wrap",gap:5,marginBottom:10}}>{opts.map(o=>{const a=sel.includes(o);return <button key={o} onClick={()=>multi?onChange(a?sel.filter(s=>s!==o):[...sel,o]):onChange(a?[]:[o])} style={a?{...S.chipA,border:"1px solid "+color,background:color+"22",color}:S.chip}>{o}</button>})}</div>}
+function VAS({value,onChange,label}){return <div style={{marginBottom:14}}>{label&&<label style={{...S.lbl,marginBottom:6}}>{label}</label>}<div style={{display:"flex",alignItems:"center",gap:10}}><input type="range" min="0" max="10" step="1" value={value||0} onChange={e=>onChange(+e.target.value)} style={{flex:1,height:6,background:`linear-gradient(to right,${vc(value||0)} ${(value||0)*10}%,#2a2d35 ${(value||0)*10}%)`}}/><span style={{minWidth:34,height:34,display:"flex",alignItems:"center",justifyContent:"center",borderRadius:8,background:vc(value||0),color:"#fff",fontWeight:700,fontSize:14}}>{value||0}</span></div></div>}
+function Sect({title,children,open:dO=true,color:cl}){const[o,setO]=useState(dO);return <div style={{marginBottom:14,background:"#1a1c24",borderRadius:12,overflow:"hidden",border:"1px solid "+(cl?cl+"44":"#252830")}}><button onClick={()=>setO(!o)} style={{width:"100%",padding:"13px 16px",display:"flex",justifyContent:"space-between",alignItems:"center",background:"none",border:"none",color:cl||"#e8e9ed",cursor:"pointer",fontSize:14,fontWeight:600}}>{title}<span style={{transform:o?"rotate(90deg)":"rotate(0)",transition:"transform .2s",color:"#666"}}>›</span></button>{o&&<div style={{padding:"0 16px 14px"}}>{children}</div>}</div>}
+function Toggle({label,value,onChange}){return <button onClick={()=>onChange(!value)} style={{padding:"8px 14px",borderRadius:8,border:"1px solid "+(value?"#2a9d8f":"#3a3d45"),background:value?"rgba(42,157,143,0.15)":"rgba(255,255,255,0.03)",color:value?"#2a9d8f":"#777",fontSize:13,cursor:"pointer",fontWeight:value?600:400,display:"inline-flex",alignItems:"center",gap:6}}>{value?"✓ ":"○ "}{label}</button>}
+
+// ═══ Daily Rhythm per type ═══
+function DailyRhythm({data={},onChange,label}){
+return <Sect title={"Добовий ритм — "+label} open={false}>
+{["5-9","9-17","17-22","22-5"].map(t=><VAS key={t} label={t} value={data[t]||0} onChange={v=>onChange({...data,[t]:v})}/>)}
+<VAS label="Постійний біль" value={data.const||0} onChange={v=>onChange({...data,const:v})}/>
+<VAS label="Випадковий біль" value={data.rand||0} onChange={v=>onChange({...data,rand:v})}/>
+<Inp label="Частота приступів" value={data.freq||""} onChange={e=>onChange({...data,freq:e.target.value})}/>
+</Sect>}
+
+// ═══ Amputation Selector ═══
+function AmpSelector({limbs,amps={},onChange}){const[ol,setOl]=useState(null);
+return <div>{Object.entries(limbs).map(([key,limb])=>{const ad=amps[key]||{};const has=!!ad.level;
+return <div key={key} style={{marginBottom:8}}>
+<button onClick={()=>setOl(ol===key?null:key)} style={{width:"100%",padding:"10px 14px",borderRadius:10,border:"1px solid "+(has?"#c8a2ff":"#2e3038"),background:has?"rgba(200,162,255,0.1)":"#1e2028",color:has?"#c8a2ff":"#9a9ea8",cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center",fontSize:13,fontWeight:has?600:400}}>
+<span>{limb.short} — {limb.name}</span><span>{has?ad.level+(ad.sub?" ("+ad.sub+")":""):"—"}</span></button>
+{ol===key&&<div style={{padding:"8px 0 4px",display:"flex",flexDirection:"column",gap:4}}>
+{limb.levels.map(lv=>{const sel=ad.level===lv.name;return <div key={lv.id}>
+<button onClick={()=>{if(sel&&!lv.sub){onChange({...amps,[key]:{}});return}onChange({...amps,[key]:{level:lv.name,sub:lv.sub?ad.sub||lv.sub[0]:null}})}} style={{width:"100%",padding:"8px 12px",borderRadius:8,border:"1px solid "+(sel?"#c8a2ff":"#252830"),background:sel?"rgba(200,162,255,0.15)":"#14151c",color:sel?"#c8a2ff":"#888",cursor:"pointer",fontSize:12,textAlign:"left",fontWeight:sel?600:400}}>{lv.name}</button>
+{sel&&lv.sub&&<div style={{display:"flex",gap:4,marginTop:4,marginLeft:12}}>{lv.sub.map(s=><button key={s} onClick={()=>onChange({...amps,[key]:{...ad,sub:s}})} style={{padding:"5px 12px",borderRadius:6,border:"1px solid "+(ad.sub===s?"#c8a2ff":"#2e3038"),background:ad.sub===s?"rgba(200,162,255,0.2)":"transparent",color:ad.sub===s?"#c8a2ff":"#666",fontSize:12,cursor:"pointer",fontWeight:600}}>{s}</button>)}</div>}
+</div>})}
+<button onClick={()=>{onChange({...amps,[key]:{}});setOl(null)}} style={{padding:"6px 12px",borderRadius:8,background:"rgba(231,111,81,0.1)",border:"1px solid rgba(231,111,81,0.3)",color:"#e76f51",fontSize:11,cursor:"pointer",marginTop:4,alignSelf:"flex-start"}}>Очистити</button>
+</div>}</div>})}</div>}
+
+// ═══ Test+Reaction selector ═══
+function TestReact({tests,data={},onChange}){return <div>{tests.map(t=>{const d=data[t]||{};const a=d.selected;return <div key={t} style={{marginBottom:6,padding:"8px 10px",background:a?"rgba(200,162,255,0.06)":"#14151c",borderRadius:8,border:"1px solid "+(a?"#3a3d45":"#1e2028")}}>
+<button onClick={()=>{const n={...data};if(a)delete n[t];else n[t]={selected:true,reactions:[]};onChange(n)}} style={{width:"100%",textAlign:"left",background:"none",border:"none",color:a?"#c8a2ff":"#888",cursor:"pointer",fontSize:12,fontWeight:a?600:400,padding:"2px 0"}}>{a?"✓ ":""}{t}</button>
+{a&&<div style={{display:"flex",flexWrap:"wrap",gap:3,marginTop:6}}>{REACTIONS.map(r=>{const ra=d.reactions?.includes(r);return <button key={r} onClick={()=>{const reacts=ra?(d.reactions||[]).filter(x=>x!==r):[...(d.reactions||[]),r];onChange({...data,[t]:{...d,reactions:reacts}})}} style={{padding:"4px 8px",borderRadius:6,border:"1px solid "+(ra?"#e9c46a":"#2a2d35"),background:ra?"rgba(233,196,106,0.15)":"transparent",color:ra?"#e9c46a":"#555",fontSize:10,cursor:"pointer",fontWeight:ra?600:400}}>{r}</button>})}</div>}
+</div>})}</div>}
+
+// ═══ Genesis Summary ═══
+function GenesisSummary({patient}){
+const gc=calcGenesis(patient);
+if(gc.total===0)return null;
+const items=[
+{name:"Периферичний",count:gc.peripheral,color:GENESIS.peripheral.color},
+{name:"Церебральний",count:gc.cerebral,color:GENESIS.cerebral.color},
+{name:"Спінальний",count:gc.spinal,color:GENESIS.spinal.color},
+{name:"Психогенний",count:gc.psychogenic,color:GENESIS.psychogenic.color},
+];
+return <div style={{padding:14,background:"#1a1c24",borderRadius:12,border:"1px solid #252830",marginBottom:14}}>
+<div style={{fontSize:13,fontWeight:700,marginBottom:10,color:"#e8e9ed"}}>Профіль генезу болю</div>
+<div style={{display:"flex",gap:8,marginBottom:10,flexWrap:"wrap"}}>{items.map(it=><div key={it.name} style={{textAlign:"center",minWidth:70}}>
+<div style={{fontSize:20,fontWeight:800,color:it.count>0?it.color:"#333"}}>{it.count}</div>
+<div style={{fontSize:10,color:it.count>0?it.color:"#444"}}>{it.name}</div>
+</div>)}</div>
+{gc.total>0&&<div style={{display:"flex",height:8,borderRadius:4,overflow:"hidden",marginBottom:8}}>
+{items.filter(i=>i.count>0).map(it=><div key={it.name} style={{flex:it.count,background:it.color,transition:"flex .3s"}}/>)}
+</div>}
+<div style={{fontSize:13,fontWeight:600}}>Домінуючий: <span style={{color:"#c8a2ff"}}>{gc.dominant}</span></div>
+</div>}
+
+// ═══ Questionnaire forms ═══
+function PCL5Form({ans=Array(20).fill(null),onChange}){const total=ans.filter(a=>a!==null).reduce((s,v)=>s+v,0);const ip=iPCL5(total);return <div><p style={{fontSize:12,color:"#8a8f98",marginBottom:10}}>Протягом останнього місяця, як сильно турбували:</p>{PCL5Q.map((q,i)=><div key={i} style={{marginBottom:10,padding:"8px 10px",background:"#14151c",borderRadius:8}}><div style={{fontSize:12,color:"#d0d2d8",marginBottom:6}}>{i+1}. {q}</div><div style={{display:"flex",gap:3,flexWrap:"wrap"}}>{PCL5OPT.map((o,oi)=><button key={oi} onClick={()=>{const n=[...ans];n[i]=oi;onChange(n)}} style={{padding:"4px 8px",borderRadius:6,border:"1px solid "+(ans[i]===oi?"#c8a2ff":"#2e3038"),background:ans[i]===oi?"rgba(200,162,255,0.2)":"transparent",color:ans[i]===oi?"#c8a2ff":"#555",fontSize:11,cursor:"pointer"}}>{oi}</button>)}</div></div>)}<div style={{padding:10,background:"#1e2028",borderRadius:8}}><strong>{total}/80</strong> — <span style={{color:ip.c}}>{ip.t}</span></div></div>}
+
+function HADSForm({ans=Array(14).fill(null),onChange}){const tS=HADS.reduce((s,h,i)=>h.s==="Т"&&ans[i]!==null?s+h.sc[ans[i]]:s,0);const dS=HADS.reduce((s,h,i)=>h.s==="Д"&&ans[i]!==null?s+h.sc[ans[i]]:s,0);const ip=iHADS(tS,dS);return <div>{HADS.map((h,i)=><div key={i} style={{marginBottom:10,padding:"8px 10px",background:"#14151c",borderRadius:8}}><div style={{fontSize:12,color:"#d0d2d8",marginBottom:6}}><span style={{color:h.s==="Т"?"#e9c46a":"#64b5f6",fontWeight:700,marginRight:5}}>{h.s}</span>{h.q}</div><div style={{display:"flex",flexDirection:"column",gap:3}}>{h.o.map((o,oi)=><button key={oi} onClick={()=>{const n=[...ans];n[i]=oi;onChange(n)}} style={{padding:"5px 10px",borderRadius:6,border:"1px solid "+(ans[i]===oi?"#c8a2ff":"#2e3038"),background:ans[i]===oi?"rgba(200,162,255,0.2)":"transparent",color:ans[i]===oi?"#c8a2ff":"#555",fontSize:12,cursor:"pointer",textAlign:"left"}}>{o}</button>)}</div></div>)}<div style={{padding:10,background:"#1e2028",borderRadius:8}}><div><span style={{color:"#e9c46a",fontWeight:600}}>Т:{tS}/21</span> — <span style={{color:ip.t.c}}>{ip.t.t}</span></div><div><span style={{color:"#64b5f6",fontWeight:600}}>Д:{dS}/21</span> — <span style={{color:ip.d.c}}>{ip.d.t}</span></div></div></div>}
+
+function AISForm({ans=Array(8).fill(null),onChange}){const total=ans.filter(a=>a!==null).reduce((s,v)=>s+v,0);const ip=iAIS(total);return <div>{AIS.map((h,i)=><div key={i} style={{marginBottom:10,padding:"8px 10px",background:"#14151c",borderRadius:8}}><div style={{fontSize:12,color:"#d0d2d8",marginBottom:6}}>{i+1}. {h.q}</div><div style={{display:"flex",flexDirection:"column",gap:3}}>{h.o.map((o,oi)=><button key={oi} onClick={()=>{const n=[...ans];n[i]=oi;onChange(n)}} style={{padding:"5px 10px",borderRadius:6,border:"1px solid "+(ans[i]===oi?"#c8a2ff":"#2e3038"),background:ans[i]===oi?"rgba(200,162,255,0.2)":"transparent",color:ans[i]===oi?"#c8a2ff":"#555",fontSize:12,cursor:"pointer",textAlign:"left"}}>{oi} — {o}</button>)}</div></div>)}<div style={{padding:10,background:"#1e2028",borderRadius:8}}><strong>{total}/24</strong> — <span style={{color:ip.c}}>{ip.t}</span></div></div>}
+
+function DN4Form({ans=Array(10).fill(null),onChange}){const total=ans.filter(a=>a===1).length;const ip=iDN4(total);let lastCat="";return <div>{DN4Q.map((h,i)=>{const showCat=h.cat!==lastCat;lastCat=h.cat;return <div key={i}>{showCat&&<div style={{fontSize:12,color:"#8a8f98",fontWeight:600,marginTop:8,marginBottom:6}}>{h.cat}</div>}<div style={{marginBottom:6,padding:"8px 10px",background:"#14151c",borderRadius:8,display:"flex",justifyContent:"space-between",alignItems:"center"}}><span style={{fontSize:12,color:"#d0d2d8",flex:1}}>{i+1}. {h.q}</span><div style={{display:"flex",gap:4}}>{["Ні","Так"].map((o,oi)=><button key={oi} onClick={()=>{const n=[...ans];n[i]=oi;onChange(n)}} style={{padding:"4px 10px",borderRadius:6,border:"1px solid "+(ans[i]===oi?"#c8a2ff":"#2e3038"),background:ans[i]===oi?"rgba(200,162,255,0.2)":"transparent",color:ans[i]===oi?"#c8a2ff":"#555",fontSize:11,cursor:"pointer"}}>{o}</button>)}</div></div></div>})}<div style={{padding:10,background:"#1e2028",borderRadius:8}}><strong>{total}/10</strong> — <span style={{color:ip.c}}>{ip.t}</span>{total>=4&&<span style={{fontSize:11,color:"#888"}}> (≥4 = нейропатичний)</span>}</div></div>}
+
+// Chart
+function Chart({data,label,color="#c8a2ff",h:ch=120}){if(!data||!data.length)return <div style={{color:"#444",fontSize:12,padding:8}}>Немає даних</div>;const max=Math.max(...data.map(d=>d.v),1),min=Math.min(...data.map(d=>d.v),0),rng=max-min||1;const w=300,pad=30;const pts=data.map((d,i)=>({x:pad+(i/Math.max(data.length-1,1))*(w-pad*2),y:ch-pad-((d.v-min)/rng)*(ch-pad*2)}));const pathD=pts.map((p,i)=>`${i===0?"M":"L"} ${p.x} ${p.y}`).join(" ");return <div style={{marginBottom:16}}><div style={{fontSize:12,color:"#8a8f98",marginBottom:4,fontWeight:500}}>{label}</div><svg viewBox={`0 0 ${w} ${ch}`} style={{width:"100%",maxWidth:w}}>{[0,.25,.5,.75,1].map(f=>{const y=ch-pad-f*(ch-pad*2);return <g key={f}><line x1={pad} y1={y} x2={w-pad} y2={y} stroke="#2a2d35" strokeWidth="1"/><text x={pad-4} y={y+4} fill="#555" fontSize="9" textAnchor="end">{Math.round(min+f*rng)}</text></g>})}<path d={pathD} fill="none" stroke={color} strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"/>{pts.map((p,i)=><g key={i}><circle cx={p.x} cy={p.y} r="4" fill={color}/><text x={p.x} y={ch-6} fill="#555" fontSize="7" textAnchor="middle">{data[i].d?.slice(5)||i+1}</text></g>)}</svg></div>}
+
+// Default patient
+const defP=()=>({id:uid(),name:"",age:"",sex:"",unit:"",ward:"",amps:{},rpni:false,ampType:"",injDate:"",ampDate:"",admDate:"",reampDate:"",crit:"",attn:"",complaints:"",
+hasFB:false,hasFV:false,hasBK:false,fbLoc:"",fbVAS:0,fvLoc:"",fvVAS:0,bkLoc:"",bkVAS:0,
+fbRhythm:{},fvRhythm:{},bkRhythm:{},
+painFlow:[],traumMem:"Відсутні",
+stumpPath:[],stumpPathNote:"",stumpPathSource:[],
+genPeripheral:[],genPeripheralOther:"",genCerebral:[],genCerebralOther:"",genSpinal:[],genSpinalOther:"",genPsychogenic:[],genPsychogenicOther:"",
+somReact:[],cerebTests:{},perTests:{},psyTests:{},
+sleepH:"",sleepOn:"Норм",sleepCont:"Без пробудж.",nightm:"Ні",sleepOther:"",
+subst:"Відсутнє",smoke:"Ні",suic:"Ні",psych:"Ні",
+exp:[],sym:[],therapy:{},moca:"",request:"",conclusion:"",recs:"",
+// Сексуальна функція
+sfPhantomOrgasmR:[],sfPhantomOrgasmL:[],sfPhantomDescOther:"",
+sfRefuse:false,sfActivity:"",sfActivityChange:"",sfErection:"",sfErectionDiff:"",
+sfOrgasm:"",sfOrgasmChange:"",sfOrgasmLoc:[],sfOrgasmLocOther:"",sfBodyZones:[],
+sfPhantomSex:"",sfPhantomDesc:[],
+sfPainDuringSex:"",sfPainIncrease:0,sfPainDecrease:0,
+sfSatisfaction:5,sfBodyImage:"",sfDiscussed:"",
+// Об'єктивні дослідження
+objImaging:[],objSurgeries:[],objRegional:[],objSystemic:[],
+// Інформована згода
+consentGiven:false,consentDate:"",consentSignature:"",
+createdAt:new Date().toISOString()});
+
+// ═══ BODY ZONES — простий список зон ═══
+const BODY_ZONE_LIST=["Голова","Шия","Грудна клітка","Живіт","Таз/Промежина","Геніталії","Ліве стегно","Праве стегно","Ліве коліно","Праве коліно","Ліва гомілка","Права гомілка","Ліва стопа","Права стопа","Ліва рука","Права рука","Фантом лівої ноги","Фантом правої ноги"];
+
+function BodyMap({amps,selected=[],onChange}){
+const toggle=z=>onChange(selected.includes(z)?selected.filter(x=>x!==z):[...selected,z]);
+return <div style={{marginBottom:14}}>
+<label style={{display:"block",fontSize:12,color:"#8a8f98",marginBottom:8,fontWeight:500}}>Де відчувається оргазм? <span style={{color:"#555",fontWeight:400}}>(можна кілька)</span></label>
+<div style={{display:"flex",flexWrap:"wrap",gap:5}}>
+{BODY_ZONE_LIST.map(z=>{
+const sel=selected.includes(z);
+const isPhantom=z.startsWith("Фантом");
+return <button key={z} onClick={()=>toggle(z)} style={{padding:"6px 11px",borderRadius:20,border:"1px solid "+(sel?(isPhantom?"#c8a2ff":"#c8a2ff"):(isPhantom?"#5a3d90":"#3a3d45")),background:sel?(isPhantom?"rgba(200,162,255,0.25)":"rgba(200,162,255,0.15)"):(isPhantom?"rgba(90,61,144,0.12)":"rgba(255,255,255,0.03)"),color:sel?"#c8a2ff":(isPhantom?"#9070c0":"#9a9ea8"),fontSize:12,cursor:"pointer",fontWeight:sel?600:400,transition:"all .12s"}}>{z}</button>;
+})}
+</div>
+</div>;
+}
+
+// ═══ SEXUAL FUNCTION FORM ═══
+function SexualFunctionForm({cur,u}){
+const SF_ORGASM_LOC=["Тільки статевий орган — як завжди","Статевий орган, але слабше або інакше","Статевий орган + десь іще","Не в статевому органі — деінде","Важко сказати"];
+const SF_PHANTOM_DESC=["Тепло","Поколювання","Пульсація","Приємне відчуття","Оніміння","Мурашки","Біль","Важко описати"];
+
+if(cur.sfRefuse)return <div style={{marginBottom:14}}>
+<div style={{padding:14,background:"#1a1c24",borderRadius:12,border:"1px solid #252830",textAlign:"center"}}>
+<div style={{color:"#555",marginBottom:10,fontSize:13}}>Пацієнт відмовився відповідати</div>
+<button onClick={()=>u("sfRefuse",false)} style={{padding:"6px 14px",borderRadius:8,border:"1px solid #2e3038",background:"#1e2028",color:"#888",cursor:"pointer",fontSize:12}}>Скасувати відмову</button>
+</div></div>;
+
+return <>
+{/* Gate */}
+<Sect title="Загальна сексуальна активність (А)">
+<div style={{marginBottom:10,padding:8,background:"rgba(200,162,255,0.05)",borderRadius:8,border:"1px solid rgba(200,162,255,0.15)",fontSize:12,color:"#8a8f98"}}>
+Цей блок є анонімним і використовується виключно для наукового дослідження.
+</div>
+<div style={{marginBottom:12}}><label style={{display:"block",fontSize:12,color:"#8a8f98",marginBottom:6,fontWeight:500}}>Чи є у вас зараз сексуальна активність?</label>
+<div style={{display:"flex",gap:4,flexWrap:"wrap"}}>
+{["Так","Ні","Відмовляюсь відповідати"].map(s=><button key={s} onClick={()=>{if(s==="Відмовляюсь відповідати"){u("sfRefuse",true)}else u("sfActivity",s)}} style={{padding:"8px 12px",borderRadius:8,border:"1px solid "+(cur.sfActivity===s?"#c8a2ff":"#2e3038"),background:cur.sfActivity===s?"rgba(200,162,255,0.15)":"#1e2028",color:cur.sfActivity===s?"#c8a2ff":"#666",cursor:"pointer",fontSize:12,fontWeight:cur.sfActivity===s?600:400}}>{s}</button>)}
+</div></div>
+
+<div style={{marginBottom:12}}><label style={{display:"block",fontSize:12,color:"#8a8f98",marginBottom:6,fontWeight:500}}>Чи змінилась сексуальна активність після ампутації?</label>
+<div style={{display:"flex",gap:4,flexWrap:"wrap"}}>
+{["Не змінилась","Зросла","Знизилась","Припинилась"].map(s=><button key={s} onClick={()=>u("sfActivityChange",s)} style={{padding:"7px 10px",borderRadius:8,border:"1px solid "+(cur.sfActivityChange===s?"#c8a2ff":"#2e3038"),background:cur.sfActivityChange===s?"rgba(200,162,255,0.15)":"#1e2028",color:cur.sfActivityChange===s?"#c8a2ff":"#666",cursor:"pointer",fontSize:12}}>{s}</button>)}
+</div></div>
+
+<div style={{marginBottom:12}}><label style={{display:"block",fontSize:12,color:"#8a8f98",marginBottom:6,fontWeight:500}}>Мимовільні ерекції (вранці, уві сні)</label>
+<div style={{display:"flex",gap:4}}>
+{["Так, регулярно","Так, рідко","Ні"].map(s=><button key={s} onClick={()=>u("sfErection",s)} style={{flex:1,padding:"7px",borderRadius:8,border:"1px solid "+(cur.sfErection===s?"#c8a2ff":"#2e3038"),background:cur.sfErection===s?"rgba(200,162,255,0.15)":"#1e2028",color:cur.sfErection===s?"#c8a2ff":"#666",cursor:"pointer",fontSize:11}}>{s}</button>)}
+</div></div>
+
+<div style={{marginBottom:4}}><label style={{display:"block",fontSize:12,color:"#8a8f98",marginBottom:6,fontWeight:500}}>Труднощі з ерекцією під час статевої активності</label>
+<div style={{display:"flex",gap:4,flexWrap:"wrap"}}>
+{["Ніколи","Іноді","Часто","Завжди"].map(s=><button key={s} onClick={()=>u("sfErectionDiff",s)} style={{flex:1,padding:"7px",borderRadius:8,border:"1px solid "+(cur.sfErectionDiff===s?"#c8a2ff":"#2e3038"),background:cur.sfErectionDiff===s?"rgba(200,162,255,0.15)":"#1e2028",color:cur.sfErectionDiff===s?"#c8a2ff":"#666",cursor:"pointer",fontSize:11}}>{s}</button>)}
+</div></div>
+</Sect>
+
+<Sect title="Оргазм (В)">
+<div style={{marginBottom:12}}><label style={{display:"block",fontSize:12,color:"#8a8f98",marginBottom:6,fontWeight:500}}>Чи досягаєте ви оргазму?</label>
+<div style={{display:"flex",gap:4,flexWrap:"wrap"}}>
+{["Так, завжди","Так, іноді","Рідко","Ніколи"].map(s=><button key={s} onClick={()=>u("sfOrgasm",s)} style={{flex:1,padding:"7px 8px",borderRadius:8,border:"1px solid "+(cur.sfOrgasm===s?"#c8a2ff":"#2e3038"),background:cur.sfOrgasm===s?"rgba(200,162,255,0.15)":"#1e2028",color:cur.sfOrgasm===s?"#c8a2ff":"#666",cursor:"pointer",fontSize:11}}>{s}</button>)}
+</div></div>
+
+<div style={{marginBottom:12}}><label style={{display:"block",fontSize:12,color:"#8a8f98",marginBottom:6,fontWeight:500}}>Чи змінився характер оргазму після ампутації?</label>
+<div style={{display:"flex",gap:4,flexWrap:"wrap"}}>
+{["Не змінився","Став інтенсивнішим","Став слабшим","Змінився якісно","Не було й до ампутації"].map(s=><button key={s} onClick={()=>u("sfOrgasmChange",s)} style={{padding:"6px 8px",borderRadius:8,border:"1px solid "+(cur.sfOrgasmChange===s?"#c8a2ff":"#2e3038"),background:cur.sfOrgasmChange===s?"rgba(200,162,255,0.15)":"#1e2028",color:cur.sfOrgasmChange===s?"#c8a2ff":"#666",cursor:"pointer",fontSize:11,marginBottom:4}}>{s}</button>)}
+</div></div>
+
+<div style={{marginBottom:12}}><label style={{display:"block",fontSize:12,color:"#8a8f98",marginBottom:6,fontWeight:500}}>Де ви відчуваєте оргазм? <span style={{color:"#555",fontWeight:400}}>(можна кілька)</span></label>
+<Chips opts={SF_ORGASM_LOC} sel={cur.sfOrgasmLoc||[]} onChange={v=>u("sfOrgasmLoc",v)} color="#c8a2ff"/>
+</div>
+
+{(cur.sfOrgasmLoc||[]).some(v=>v==="Статевий орган + десь іще"||v==="Не в статевому органі — деінде")&&
+<BodyMap selected={cur.sfBodyZones||[]} onChange={v=>u("sfBodyZones",v)}/>}
+
+</Sect>
+
+<Sect title="Фантомний компонент (С)">
+<div style={{marginBottom:12}}><label style={{display:"block",fontSize:12,color:"#8a8f98",marginBottom:6,fontWeight:500}}>Чи є відчуття у фантомній кінцівці під час збудження або оргазму?</label>
+<div style={{display:"flex",gap:4}}>
+{["Так","Ні","Не впевнений"].map(s=><button key={s} onClick={()=>u("sfPhantomSex",s)} style={{flex:1,padding:"8px",borderRadius:8,border:"1px solid "+(cur.sfPhantomSex===s?"#c8a2ff":"#2e3038"),background:cur.sfPhantomSex===s?"rgba(200,162,255,0.15)":"#1e2028",color:cur.sfPhantomSex===s?"#c8a2ff":"#666",cursor:"pointer",fontSize:12}}>{s}</button>)}
+</div></div>
+
+{cur.sfPhantomSex==="Так"&&<><div style={{marginBottom:12}}><label style={{display:"block",fontSize:12,color:"#8a8f98",marginBottom:6,fontWeight:500}}>Відчуття оргазму у фантомній кінцівці <span style={{color:"#555",fontWeight:400}}>(можна кілька)</span></label>
+<div style={{marginBottom:6,fontSize:11,color:"#7050b0",fontWeight:600}}>Права фантомна</div>
+<Chips opts={["П.стопа","П.гомілка","П.коліно","П.стегно"]} sel={cur.sfPhantomOrgasmR||[]} onChange={v=>u("sfPhantomOrgasmR",v)} color="#c8a2ff"/>
+<div style={{marginBottom:6,fontSize:11,color:"#7050b0",fontWeight:600}}>Ліва фантомна</div>
+<Chips opts={["Л.стопа","Л.гомілка","Л.коліно","Л.стегно"]} sel={cur.sfPhantomOrgasmL||[]} onChange={v=>u("sfPhantomOrgasmL",v)} color="#c8a2ff"/>
+</div>
+<div style={{marginBottom:12}}><label style={{display:"block",fontSize:12,color:"#8a8f98",marginBottom:6,fontWeight:500}}>Характер фантомного оргазму <span style={{color:"#555",fontWeight:400}}>(можна кілька)</span></label>
+<Chips opts={["Повне повторення відчуттів статевого органу","Фрикції","Скорочення","Удари струмом","Приємні удари струмом","Хвилеподібні відчуття"]} sel={cur.sfPhantomDesc||[]} onChange={v=>u("sfPhantomDesc",v)} color="#c8a2ff"/>
+<div style={{marginTop:6}}><input placeholder="Свій варіант..." value={cur.sfPhantomDescOther||""} onChange={e=>u("sfPhantomDescOther",e.target.value)} style={{width:"100%",padding:"8px 10px",background:"#1e2028",border:"1px solid #2e3038",borderRadius:8,color:"#e8e9ed",fontSize:12,outline:"none",boxSizing:"border-box"}} onFocus={e=>e.target.style.borderColor="#c8a2ff"} onBlur={e=>e.target.style.borderColor="#2e3038"}/></div>
+</div></>}
+
+<div style={{marginBottom:12}}><label style={{display:"block",fontSize:12,color:"#8a8f98",marginBottom:6,fontWeight:500}}>Чи змінюється фантомний біль під час або після сексу?</label>
+<div style={{display:"flex",gap:4,flexWrap:"wrap"}}>
+{["Не змінюється","Посилюється","Зменшується"].map(s=><button key={s} onClick={()=>u("sfPainDuringSex",s)} style={{flex:1,padding:"7px",borderRadius:8,border:"1px solid "+(cur.sfPainDuringSex===s?"#c8a2ff":"#2e3038"),background:cur.sfPainDuringSex===s?"rgba(200,162,255,0.15)":"#1e2028",color:cur.sfPainDuringSex===s?"#c8a2ff":"#666",cursor:"pointer",fontSize:11}}>{s}</button>)}
+</div></div>
+
+{cur.sfPainDuringSex==="Посилюється"&&<div style={{marginBottom:12,padding:"10px 12px",background:"rgba(231,111,81,0.07)",borderRadius:10,border:"1px solid rgba(231,111,81,0.2)"}}>
+<label style={{display:"block",fontSize:12,color:"#e76f51",marginBottom:8,fontWeight:500}}>Наскільки сильніше? (0 = так само, 10 = нестерпно)</label>
+<div style={{display:"flex",alignItems:"center",gap:10}}>
+<input type="range" min="0" max="10" step="1" value={cur.sfPainIncrease||0} onChange={e=>u("sfPainIncrease",+e.target.value)} style={{flex:1,height:6,background:`linear-gradient(to right,#e76f51 ${(cur.sfPainIncrease||0)*10}%,#2a2d35 ${(cur.sfPainIncrease||0)*10}%)`}}/>
+<span style={{minWidth:34,height:34,display:"flex",alignItems:"center",justifyContent:"center",borderRadius:8,background:"rgba(231,111,81,0.2)",color:"#e76f51",fontWeight:700,fontSize:14}}>{cur.sfPainIncrease||0}</span>
+</div></div>}
+
+{cur.sfPainDuringSex==="Зменшується"&&<div style={{marginBottom:12,padding:"10px 12px",background:"rgba(42,157,143,0.07)",borderRadius:10,border:"1px solid rgba(42,157,143,0.2)"}}>
+<label style={{display:"block",fontSize:12,color:"#2a9d8f",marginBottom:8,fontWeight:500}}>Наскільки слабше? (0 = так само, 10 = зникає повністю)</label>
+<div style={{display:"flex",alignItems:"center",gap:10}}>
+<input type="range" min="0" max="10" step="1" value={cur.sfPainDecrease||0} onChange={e=>u("sfPainDecrease",+e.target.value)} style={{flex:1,height:6,background:`linear-gradient(to right,#2a9d8f ${(cur.sfPainDecrease||0)*10}%,#2a2d35 ${(cur.sfPainDecrease||0)*10}%)`}}/>
+<span style={{minWidth:34,height:34,display:"flex",alignItems:"center",justifyContent:"center",borderRadius:8,background:"rgba(42,157,143,0.2)",color:"#2a9d8f",fontWeight:700,fontSize:14}}>{cur.sfPainDecrease||0}</span>
+</div></div>}
+</Sect>
+
+<Sect title="Тіло та психологія (D)">
+<div style={{marginBottom:14}}><label style={{display:"block",fontSize:12,color:"#8a8f98",marginBottom:8,fontWeight:500}}>Задоволеність сексуальним життям зараз (0 — повністю незадоволений, 10 — цілком задоволений)</label>
+<div style={{display:"flex",alignItems:"center",gap:10}}>
+<input type="range" min="0" max="10" step="1" value={cur.sfSatisfaction??5} onChange={e=>u("sfSatisfaction",+e.target.value)} style={{flex:1,height:6,background:`linear-gradient(to right,${vc(cur.sfSatisfaction??5)} ${(cur.sfSatisfaction??5)*10}%,#2a2d35 ${(cur.sfSatisfaction??5)*10}%)`}}/>
+<span style={{minWidth:34,height:34,display:"flex",alignItems:"center",justifyContent:"center",borderRadius:8,background:vc(cur.sfSatisfaction??5),color:"#fff",fontWeight:700,fontSize:14}}>{cur.sfSatisfaction??5}</span>
+</div></div>
+
+<div style={{marginBottom:12}}><label style={{display:"block",fontSize:12,color:"#8a8f98",marginBottom:6,fontWeight:500}}>Вплив образу тіла після ампутації на сексуальне життя</label>
+<div style={{display:"flex",gap:4,flexWrap:"wrap"}}>
+{["Не впливає","Трохи впливає","Суттєво впливає","Є основною перешкодою"].map(s=><button key={s} onClick={()=>u("sfBodyImage",s)} style={{padding:"6px 8px",borderRadius:8,border:"1px solid "+(cur.sfBodyImage===s?"#c8a2ff":"#2e3038"),background:cur.sfBodyImage===s?"rgba(200,162,255,0.15)":"#1e2028",color:cur.sfBodyImage===s?"#c8a2ff":"#666",cursor:"pointer",fontSize:11,marginBottom:4}}>{s}</button>)}
+</div></div>
+
+<div style={{marginBottom:4}}><label style={{display:"block",fontSize:12,color:"#8a8f98",marginBottom:6,fontWeight:500}}>Чи обговорювали це питання з лікарем або психологом?</label>
+<div style={{display:"flex",gap:4,flexWrap:"wrap"}}>
+{["Так","Ні","Хотів, але не знав до кого"].map(s=><button key={s} onClick={()=>u("sfDiscussed",s)} style={{flex:1,padding:"7px 8px",borderRadius:8,border:"1px solid "+(cur.sfDiscussed===s?"#c8a2ff":"#2e3038"),background:cur.sfDiscussed===s?"rgba(200,162,255,0.15)":"#1e2028",color:cur.sfDiscussed===s?"#c8a2ff":"#666",cursor:"pointer",fontSize:11}}>{s}</button>)}
+</div></div>
+</Sect>
+</>}
+
+// ═══ CONSENT FORM ═══
+function ConsentForm({cur,u}){
+const canvasRef=React.useRef(null);
+const drawing=React.useRef(false);
+const[hasSig,setHasSig]=React.useState(!!cur.consentSignature);
+
+React.useEffect(()=>{
+if(!canvasRef.current)return;
+const canvas=canvasRef.current;
+const ctx=canvas.getContext("2d");
+// Ретина-дисплей
+const dpr=window.devicePixelRatio||1;
+canvas.width=canvas.offsetWidth*dpr;
+canvas.height=canvas.offsetHeight*dpr;
+ctx.scale(dpr,dpr);
+ctx.strokeStyle="#c8a2ff";
+ctx.lineWidth=2;
+ctx.lineCap="round";
+ctx.lineJoin="round";
+// Відновити збережений підпис
+if(cur.consentSignature){
+const img=new Image();
+img.onload=()=>ctx.drawImage(img,0,0,canvas.offsetWidth,canvas.offsetHeight);
+img.src=cur.consentSignature;
+}
+},[]);
+
+const getPos=(e,canvas)=>{
+const r=canvas.getBoundingClientRect();
+const src=e.touches?e.touches[0]:e;
+return{x:src.clientX-r.left,y:src.clientY-r.top};
+};
+
+const startDraw=e=>{
+e.preventDefault();
+drawing.current=true;
+const canvas=canvasRef.current;
+const ctx=canvas.getContext("2d");
+const{x,y}=getPos(e,canvas);
+ctx.beginPath();ctx.moveTo(x,y);
+};
+
+const draw=e=>{
+e.preventDefault();
+if(!drawing.current)return;
+const canvas=canvasRef.current;
+const ctx=canvas.getContext("2d");
+const{x,y}=getPos(e,canvas);
+ctx.lineTo(x,y);ctx.stroke();
+setHasSig(true);
+};
+
+const endDraw=e=>{
+e.preventDefault();
+if(!drawing.current)return;
+drawing.current=false;
+const sig=canvasRef.current.toDataURL("image/png");
+u("consentSignature",sig);
+u("consentGiven",true);
+if(!cur.consentDate)u("consentDate",new Date().toISOString().slice(0,10));
+};
+
+const clear=()=>{
+const canvas=canvasRef.current;
+const ctx=canvas.getContext("2d");
+ctx.clearRect(0,0,canvas.width,canvas.height);
+setHasSig(false);
+u("consentSignature","");
+u("consentGiven",false);
+};
+
+const CONSENT_TEXT=`ІНФОРМОВАНА ЗГОДА
+на участь у науковому дослідженні та обробку персональних даних
+
+Дослідник: Іордек Єгор Борисович, психолог
+Установа: Військова частина А4799
+Контакти: тел. 096-119-40-20, yehor.iordek@gmail.com
+
+1. НАЗВА ДОСЛІДЖЕННЯ
+«Клінічне дослідження постампутаційного синдрому та коморбідних розладів: генез, симптоматика, діагностика та терапія»
+
+2. МЕТА ДОСЛІДЖЕННЯ
+Вивчення клінічних характеристик фантомного болю, фантомних відчуттів, психологічного стану та супутніх розладів у військовослужбовців з ампутацією кінцівок з метою розробки ефективних методів діагностики та лікування.
+
+3. ЯКІ ДАНІ ЗБИРАЮТЬСЯ
+Демографічні дані (вік, стать, військова частина), медичні дані (рівень та характер ампутації, больовий профіль, генез болю, результати психологічних тестів: PCL-5, HADS, AIS, DN-4, MoCA), дані про сексуальну функцію, заключення та рекомендації.
+
+4. ПОРЯДОК ЗБЕРІГАННЯ ТА ЗАХИСТУ ДАНИХ
+Усі дані зберігаються локально на захищеному пристрої дослідника. Дані знеособлюються перед будь-яким аналізом або публікацією — ваше ім'я та особисті ідентифікатори не з'являться в жодному звіті чи науковій публікації. Передача даних третім особам не здійснюється.
+
+5. ВИКОРИСТАННЯ ДАНИХ
+Зібрані дані можуть використовуватися виключно в наукових та освітніх цілях: для статистичного аналізу, підготовки наукових публікацій, дисертаційного дослідження та розробки клінічних рекомендацій. Усі публікації відповідають вимогам Гельсінської декларації WMA щодо етичних принципів медичних досліджень за участю людини та Закону України «Про захист персональних даних» №2297-VI.
+
+6. ДОБРОВІЛЬНІСТЬ УЧАСТІ
+Ваша участь є повністю добровільною. Ви маєте право:
+— відмовитися від участі в дослідженні без будь-яких наслідків;
+— відкликати цю згоду в будь-який момент, звернувшись до дослідника;
+— відмовитися відповідати на будь-яке питання без пояснення причин.
+Відмова від участі жодним чином не вплине на якість надання вам медичної та психологічної допомоги.
+
+7. КОНТАКТИ
+З будь-яких питань щодо дослідження звертайтесь:
+Іордек Єгор Борисович
+Тел.: 096-119-40-20
+Email: yehor.iordek@gmail.com`;
+
+return <>
+<div style={{padding:"10px 0 14px"}}>
+<div style={{padding:14,background:"#1a1c24",borderRadius:12,border:"1px solid #252830",marginBottom:14,fontSize:12,color:"#c8d0d8",lineHeight:1.6,whiteSpace:"pre-line"}}>
+{CONSENT_TEXT}
+</div>
+
+<div style={{padding:12,background:cur.consentGiven?"rgba(42,157,143,0.08)":"rgba(200,162,255,0.05)",borderRadius:10,border:"1px solid "+(cur.consentGiven?"rgba(42,157,143,0.3)":"rgba(200,162,255,0.15)"),marginBottom:14}}>
+<div style={{fontSize:13,fontWeight:600,color:cur.consentGiven?"#2a9d8f":"#c8a2ff",marginBottom:4}}>
+{cur.consentGiven?"✓ Згода надана":"Підпис пацієнта"}
+</div>
+<div style={{fontSize:11,color:"#666",marginBottom:10}}>
+Підпишіться пальцем або стилусом у полі нижче
+</div>
+<canvas ref={canvasRef}
+onMouseDown={startDraw} onMouseMove={draw} onMouseUp={endDraw} onMouseLeave={endDraw}
+onTouchStart={startDraw} onTouchMove={draw} onTouchEnd={endDraw}
+style={{width:"100%",height:120,background:"#12131a",borderRadius:8,border:"1px solid "+(hasSig?"#c8a2ff":"#2e3038"),display:"block",touchAction:"none",cursor:"crosshair"}}/>
+<div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginTop:8}}>
+{cur.consentDate&&<div style={{fontSize:11,color:"#555"}}>Дата: {cur.consentDate}</div>}
+<button onClick={clear} style={{padding:"5px 12px",borderRadius:6,border:"1px solid rgba(231,111,81,0.3)",background:"rgba(231,111,81,0.08)",color:"#e76f51",fontSize:11,cursor:"pointer",marginLeft:"auto"}}>Очистити</button>
+</div>
+</div>
+
+<div style={{marginBottom:14}}><label style={{display:"block",fontSize:12,color:"#8a8f98",marginBottom:6,fontWeight:500}}>Дата підписання</label>
+<input type="date" value={cur.consentDate||""} onChange={e=>u("consentDate",e.target.value)} style={{width:"100%",padding:"10px 12px",background:"#1e2028",border:"1px solid #2e3038",borderRadius:8,color:"#e8e9ed",fontSize:14,outline:"none"}}/>
+</div>
+</div>
+</>}
+
+// ═══ OBJECTIVE STUDIES FORM ═══
+function ObjectiveForm({cur,u}){
+const uid2=()=>Date.now().toString(36)+Math.random().toString(36).slice(2);
+
+// Генерує порожній запис для кожного типу
+const newImaging=()=>({id:uid2(),type:"",date:"",conclusion:"",hasPhoto:false});
+const newSurgery=()=>({id:uid2(),name:"",date:"",hasPhoto:false});
+const newRegional=()=>({id:uid2(),name:"",date:"",hasPhoto:false});
+const newSystemic=()=>({id:uid2(),name:"",dose:"",date:"",hasPhoto:false});
+
+const updList=(field,id,patch)=>{
+  u(field,(cur[field]||[]).map(x=>x.id===id?{...x,...patch}:x));
+};
+const delItem=(field,id)=>u(field,(cur[field]||[]).filter(x=>x.id!==id));
+const addItem=(field,empty)=>u(field,[...(cur[field]||[]),empty]);
+
+const rowStyle={padding:"10px 12px",background:"#14151c",borderRadius:10,marginBottom:8,border:"1px solid #252830"};
+const inpS={width:"100%",padding:"7px 10px",background:"#1e2028",border:"1px solid #2e3038",borderRadius:7,color:"#e8e9ed",fontSize:12,outline:"none",boxSizing:"border-box",marginBottom:6};
+const lblS={fontSize:11,color:"#8a8f98",marginBottom:3,display:"block",fontWeight:500};
+const PhotoToggle=({val,onChange})=>(
+  <button onClick={()=>onChange(!val)} style={{padding:"4px 10px",borderRadius:6,border:"1px solid "+(val?"#2a9d8f":"#2e3038"),background:val?"rgba(42,157,143,0.15)":"transparent",color:val?"#2a9d8f":"#555",fontSize:11,cursor:"pointer",fontWeight:val?600:400}}>
+    {val?"📎 Фото є":"📎 Фото"}
+  </button>
+);
+const DelBtn=({onClick})=>(
+  <button onClick={onClick} style={{padding:"3px 8px",borderRadius:6,border:"1px solid rgba(231,111,81,0.25)",background:"rgba(231,111,81,0.08)",color:"#e76f51",fontSize:11,cursor:"pointer"}}>✕</button>
+);
+const AddBtn=({label,onClick})=>(
+  <button onClick={onClick} style={{width:"100%",padding:"8px",borderRadius:8,border:"1px dashed #3a3d45",background:"transparent",color:"#666",fontSize:12,cursor:"pointer",marginTop:4}}>+ {label}</button>
+);
+
+const IMAGING_TYPES=["УЗД","Рентген","КТ","МРТ"];
+
+return <>
+{/* ВІЗУАЛІЗАЦІЯ */}
+<Sect title="Інструментальні дослідження">
+{(cur.objImaging||[]).map(item=>(
+  <div key={item.id} style={rowStyle}>
+    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+      <div style={{display:"flex",gap:4,flexWrap:"wrap"}}>
+        {IMAGING_TYPES.map(t=>(
+          <button key={t} onClick={()=>updList("objImaging",item.id,{type:t})}
+            style={{padding:"4px 10px",borderRadius:6,border:"1px solid "+(item.type===t?"#c8a2ff":"#2e3038"),background:item.type===t?"rgba(200,162,255,0.15)":"transparent",color:item.type===t?"#c8a2ff":"#555",fontSize:11,cursor:"pointer",fontWeight:item.type===t?600:400}}>{t}</button>
+        ))}
+      </div>
+      <DelBtn onClick={()=>delItem("objImaging",item.id)}/>
+    </div>
+    <input type="date" value={item.date||""} onChange={e=>updList("objImaging",item.id,{date:e.target.value})} style={{...inpS,marginBottom:6}}/>
+    <textarea placeholder="Заключення..." value={item.conclusion||""} onChange={e=>updList("objImaging",item.id,{conclusion:e.target.value})}
+      style={{...inpS,minHeight:60,resize:"vertical",fontFamily:"inherit",marginBottom:6}}/>
+    <PhotoToggle val={item.hasPhoto} onChange={v=>updList("objImaging",item.id,{hasPhoto:v})}/>
+  </div>
+))}
+<AddBtn label="Додати дослідження" onClick={()=>addItem("objImaging",newImaging())}/>
+</Sect>
+
+{/* ОПЕРАТИВНІ ВТРУЧАННЯ */}
+<Sect title="Оперативні втручання">
+{(cur.objSurgeries||[]).map(item=>(
+  <div key={item.id} style={rowStyle}>
+    <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:8}}>
+      <div style={{flex:1}}>
+        <label style={lblS}>Назва втручання</label>
+        <input value={item.name||""} onChange={e=>updList("objSurgeries",item.id,{name:e.target.value})}
+          placeholder="Введіть назву..." style={inpS}/>
+        <label style={lblS}>Дата</label>
+        <input type="date" value={item.date||""} onChange={e=>updList("objSurgeries",item.id,{date:e.target.value})} style={inpS}/>
+      </div>
+      <DelBtn onClick={()=>delItem("objSurgeries",item.id)}/>
+    </div>
+    <PhotoToggle val={item.hasPhoto} onChange={v=>updList("objSurgeries",item.id,{hasPhoto:v})}/>
+  </div>
+))}
+<AddBtn label="Додати втручання" onClick={()=>addItem("objSurgeries",newSurgery())}/>
+</Sect>
+
+{/* РЕГІОНАРНЕ ЗНЕБОЛЕННЯ */}
+<Sect title="Регіонарне знеболення">
+{(cur.objRegional||[]).map(item=>(
+  <div key={item.id} style={rowStyle}>
+    <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:8}}>
+      <div style={{flex:1}}>
+        <label style={lblS}>Назва блокади/методу</label>
+        <input value={item.name||""} onChange={e=>updList("objRegional",item.id,{name:e.target.value})}
+          placeholder="Введіть назву..." style={inpS}/>
+        <label style={lblS}>Дата</label>
+        <input type="date" value={item.date||""} onChange={e=>updList("objRegional",item.id,{date:e.target.value})} style={inpS}/>
+      </div>
+      <DelBtn onClick={()=>delItem("objRegional",item.id)}/>
+    </div>
+    <PhotoToggle val={item.hasPhoto} onChange={v=>updList("objRegional",item.id,{hasPhoto:v})}/>
+  </div>
+))}
+<AddBtn label="Додати регіонарне знеболення" onClick={()=>addItem("objRegional",newRegional())}/>
+</Sect>
+
+{/* СИСТЕМНЕ ЗНЕБОЛЕННЯ */}
+<Sect title="Системне знеболення / Фармакотерапія">
+{(cur.objSystemic||[]).map(item=>(
+  <div key={item.id} style={rowStyle}>
+    <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:8}}>
+      <div style={{flex:1}}>
+        <label style={lblS}>Препарат</label>
+        <input value={item.name||""} onChange={e=>updList("objSystemic",item.id,{name:e.target.value})}
+          placeholder="Назва препарату..." style={inpS}/>
+        <label style={lblS}>Дозування / схема</label>
+        <input value={item.dose||""} onChange={e=>updList("objSystemic",item.id,{dose:e.target.value})}
+          placeholder="напр. 300 мг × 2 рази/добу" style={inpS}/>
+        <label style={lblS}>Дата призначення</label>
+        <input type="date" value={item.date||""} onChange={e=>updList("objSystemic",item.id,{date:e.target.value})} style={inpS}/>
+      </div>
+      <DelBtn onClick={()=>delItem("objSystemic",item.id)}/>
+    </div>
+    <PhotoToggle val={item.hasPhoto} onChange={v=>updList("objSystemic",item.id,{hasPhoto:v})}/>
+  </div>
+))}
+<AddBtn label="Додати препарат / призначення" onClick={()=>addItem("objSystemic",newSystemic())}/>
+</Sect>
+</>}
+
+// ═══ TFB SESSIONS VIEW ═══
+const TFB_TECHNIQUES=["Дзеркальна терапія (4 етапи)","Муляж-терапія (4 етапи)","Муляж-терапія з телескопією","Телескопія гумкою/рушником","Контрлатеральна стимуляція (синхронізація відчуттів)","Brainspotting","DBT","Somatic Experience","Тапінг по тілу (переписування кордонів)","Мозочкова стимуляція","Мозочкова стимуляція + контрлатеральна стимуляція","Сенсорна інтеграція","Навчання новим руховим патернам"];
+const TFB_RESULTS=["ФБ збільшився","ФБ зменшився","ФБ зник","ФВ збільшились","ФВ зменшились","ФВ зникли","Телескопія","Зворотна телескопія","Без змін"];
+
+function TFBSessionsView({pid,tfbSessions,saveTFB,delTFB}){
+const[editing,setEditing]=useState(null);
+const sessions=tfbSessions.filter(s=>s.pid===pid).sort((a,b)=>b.date>a.date?1:-1);
+
+const newSession=()=>({id:uid(),pid,date:new Date().toISOString().slice(0,10),
+cerebTests:{},perTests:{},psyTests:{},
+techniques:[],techniquesOther:"",
+results:[],resultsOther:""});
+
+const save=s=>{saveTFB(s);setEditing(null);};
+
+if(editing){
+const u=(f,v)=>setEditing({...editing,[f]:v});
+return <div>
+<div style={{display:"flex",alignItems:"center",gap:10,marginBottom:14}}>
+<button onClick={()=>setEditing(null)} style={{background:"none",border:"none",color:"#c8a2ff",fontSize:20,cursor:"pointer",padding:0}}>←</button>
+<span style={{fontSize:15,fontWeight:700,flex:1}}>Сесія ТФБ</span>
+<Btn onClick={()=>save(editing)} style={{padding:"7px 14px"}}>✓ Зберегти</Btn>
+</div>
+
+<Inp label="Дата сесії" type="date" value={editing.date} onChange={e=>u("date",e.target.value)}/>
+
+<Sect title="Тести (проведені перед/під час сесії)" open={false}>
+<p style={{fontSize:11,color:"#666",marginBottom:10}}>Оберіть тест → вкажіть реакцію</p>
+<Sect title="Церебральні тести" open={false}><TestReact tests={CEREBRAL_TESTS} data={editing.cerebTests||{}} onChange={v=>u("cerebTests",v)}/></Sect>
+<Sect title="Периферичні тести" open={false}><TestReact tests={PERIPHERAL_TESTS} data={editing.perTests||{}} onChange={v=>u("perTests",v)}/></Sect>
+<Sect title="Психогенні тести" open={false}><TestReact tests={PSYCHOGENIC_TESTS} data={editing.psyTests||{}} onChange={v=>u("psyTests",v)}/></Sect>
+</Sect>
+
+<Sect title="Застосована техніка терапії">
+<Chips opts={TFB_TECHNIQUES} sel={editing.techniques||[]} onChange={v=>u("techniques",v)} color="#c8a2ff"/>
+<Inp label="Інші техніки" value={editing.techniquesOther||""} onChange={e=>u("techniquesOther",e.target.value)} placeholder="Введіть назву..."/>
+</Sect>
+
+<Sect title="Результат сесії">
+<Chips opts={TFB_RESULTS} sel={editing.results||[]} onChange={v=>u("results",v)} color="#2a9d8f"/>
+<Inp label="Інші реакції" value={editing.resultsOther||""} onChange={e=>u("resultsOther",e.target.value)} placeholder="Описати..."/>
+</Sect>
+</div>;
+}
+
+return <div>
+<Btn onClick={()=>setEditing(newSession())} style={{width:"100%",justifyContent:"center",marginBottom:14}}>+ Нова сесія ТФБ</Btn>
+{sessions.length===0&&<div style={{textAlign:"center",padding:"30px",color:"#444",fontSize:13}}>Сесій ТФБ ще немає</div>}
+{sessions.map(s=>{
+const techCount=( s.techniques||[]).length+(s.techniquesOther?1:0);
+const resCount=(s.results||[]).length+(s.resultsOther?1:0);
+return <div key={s.id} style={{padding:12,background:"#1a1c24",borderRadius:10,marginBottom:8,border:"1px solid #252830"}}>
+<div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+<div>
+<div style={{fontSize:13,fontWeight:700,marginBottom:3}}>{s.date}</div>
+<div style={{fontSize:11,color:"#666"}}>
+{techCount>0&&<span style={{color:"#c8a2ff",marginRight:8}}>🔧 {techCount} техн.</span>}
+{resCount>0&&<span style={{color:"#2a9d8f"}}>✓ {resCount} рез.</span>}
+{(s.results||[]).includes("ФБ зменшився")&&<span style={{color:"#2a9d8f",marginLeft:4}}>↓ФБ</span>}
+{(s.results||[]).includes("ФБ зник")&&<span style={{color:"#2a9d8f",marginLeft:4}}>✕ФБ</span>}
+{(s.results||[]).includes("ФБ збільшився")&&<span style={{color:"#e76f51",marginLeft:4}}>↑ФБ</span>}
+</div>
+</div>
+<div style={{display:"flex",gap:6}}>
+<button onClick={()=>setEditing(s)} style={{background:"none",border:"none",color:"#555",cursor:"pointer",fontSize:18}}>✎</button>
+<button onClick={()=>{if(confirm("Видалити сесію?"))delTFB(s.id)}} style={{background:"none",border:"none",color:"rgba(231,111,81,0.5)",cursor:"pointer",fontSize:16}}>✕</button>
+</div>
+</div>
+</div>;})}
+</div>;}
+
+// ═══ WORD EXPORT ═══
+async function exportWordDoc(patient, allAsms, conclusionText) {
+  const {Document,Packer,Paragraph,TextRun,HeadingLevel,AlignmentType,Table,TableRow,TableCell,WidthType,BorderStyle,ShadingType}=docx;
+
+  const asms=allAsms.filter(a=>a.pid===patient.id).sort((a,b)=>a.date>b.date?1:-1);
+  const gc=calcGenesis(patient);
+  const ampStr=Object.entries(patient.amps||{}).filter(([,v])=>v.level)
+    .map(([k,v])=>`${LIMBS[k]?.name}: ${v.level}${v.sub?" ("+v.sub+")":""}`).join("\n");
+
+  const H1=(t)=>new Paragraph({text:t,heading:HeadingLevel.HEADING_1,spacing:{before:300,after:120}});
+  const H2=(t)=>new Paragraph({text:t,heading:HeadingLevel.HEADING_2,spacing:{before:200,after:80}});
+  const Row=(label,val)=>!val?"":new Paragraph({
+    children:[new TextRun({text:label+": ",bold:true,size:22}),new TextRun({text:String(val),size:22})],
+    spacing:{after:60}
+  });
+  const Sep=()=>new Paragraph({text:"",border:{bottom:{style:BorderStyle.SINGLE,size:6,color:"CCCCCC"}},spacing:{after:120}});
+  const P=(t)=>new Paragraph({text:String(t||""),spacing:{after:80},size:22});
+
+  const nz=(v)=>v||"—";
+  const yn=(v)=>v?"Так":"Ні";
+
+  // ── filter out empty strings ──
+  const rows=[];
+  const add=(label,val)=>{if(val!==undefined&&val!==null&&val!==""&&val!==false){const r=Row(label,val);if(r)rows.push(r);}};
+
+  const children=[
+    // ══ ШАПКА ══
+    new Paragraph({
+      children:[new TextRun({text:"ПСИХОЛОГІЧНА КАРТКА ПАЦІЄНТА",bold:true,size:32,color:"4A2C8F"})],
+      alignment:AlignmentType.CENTER,spacing:{after:100}
+    }),
+    new Paragraph({
+      children:[new TextRun({text:`Дата формування: ${new Date().toLocaleDateString("uk-UA")}`,size:20,color:"888888"})],
+      alignment:AlignmentType.CENTER,spacing:{after:300}
+    }),
+
+    // ══ 1. ЗАГАЛЬНІ ДАНІ ══
+    H1("1. ЗАГАЛЬНІ ДАНІ"),
+  ];
+
+  add("ПІП",patient.name);
+  add("Вік",patient.age);
+  add("Стать",patient.sex);
+  add("Військова частина",patient.unit?"А"+patient.unit:"");
+  add("Палата",patient.ward);
+  add("Дата поранення",patient.injDate);
+  add("Дата ампутації",patient.ampDate);
+  add("Дата поступлення",patient.admDate);
+  add("Дата реампутації",patient.reampDate);
+  add("Тип ампутації",patient.ampType);
+  add("RPNI",yn(patient.rpni));
+  add("Критика до стану",patient.crit);
+  add("Увага (конц.)",patient.attn);
+  add("Скарги",patient.complaints);
+  add("Запит пацієнта",patient.request);
+  children.push(...rows.splice(0));
+  children.push(Sep());
+
+  // ══ 2. АМПУТАЦІЇ ══
+  children.push(H1("2. РІВНІ АМПУТАЦІЙ"));
+  if(ampStr){children.push(P(ampStr));}else{children.push(P("Не вказано"));}
+  children.push(Sep());
+
+  // ══ 3. БОЛЬОВИЙ ПРОФІЛЬ ══
+  children.push(H1("3. БОЛЬОВИЙ ПРОФІЛЬ"));
+  if(patient.hasFB){
+    children.push(H2("Фантомний біль (Ф.Б.)"));
+    add("Локалізація",patient.fbLoc); add("VAS",patient.fbVAS+"/10");
+    const fbR=Object.entries(patient.fbRhythm||{}).filter(([,v])=>v).map(([k])=>k).join(", ");
+    add("Добовий ритм",fbR);
+    children.push(...rows.splice(0));
+  }
+  if(patient.hasFV){
+    children.push(H2("Фантомні відчуття (Ф.В.)"));
+    add("Локалізація",patient.fvLoc); add("VAS",patient.fvVAS+"/10");
+    const fvR=Object.entries(patient.fvRhythm||{}).filter(([,v])=>v).map(([k])=>k).join(", ");
+    add("Добовий ритм",fvR);
+    children.push(...rows.splice(0));
+  }
+  if(patient.hasBK){
+    children.push(H2("Біль кукси (Б.К.)"));
+    add("Локалізація",patient.bkLoc); add("VAS",patient.bkVAS+"/10");
+    const bkR=Object.entries(patient.bkRhythm||{}).filter(([,v])=>v).map(([k])=>k).join(", ");
+    add("Добовий ритм",bkR);
+    children.push(...rows.splice(0));
+  }
+  if(!patient.hasFB&&!patient.hasFV&&!patient.hasBK){children.push(P("Фантомний біль/відчуття/біль кукси не відзначені"));}
+  add("Характер протікання",(patient.painFlow||[]).join(", "));
+  add("Травм. спогади",patient.traumMem);
+  add("Соматичні реакції",(patient.somReact||[]).join(", "));
+  children.push(...rows.splice(0));
+  // патологія кукси
+  if((patient.stumpPath||[]).length>0){
+    children.push(H2("Патологія кукси"));
+    add("Виявлено",(patient.stumpPath||[]).join(", "));
+    add("Джерело виявлення",(patient.stumpPathSource||[]).join(", "));
+    add("Примітка",patient.stumpPathNote);
+    children.push(...rows.splice(0));
+  }
+  children.push(Sep());
+
+  // ══ 4. ГЕНЕЗ БОЛЬОВОГО СИНДРОМУ ══
+  children.push(H1("4. ГЕНЕЗ БОЛЬОВОГО СИНДРОМУ"));
+  add("Домінуючий генез",gc.dominant);
+  add("Периферичний",patient.genPeripheral?.join(", ")||(gc.peripheral>0?`${gc.peripheral} дескр.`:""));
+  if(patient.genPeripheralOther) add("Периф. (інше)",patient.genPeripheralOther);
+  add("Церебральний",patient.genCerebral?.join(", ")||(gc.cerebral>0?`${gc.cerebral} дескр.`:""));
+  if(patient.genCerebralOther) add("Церебр. (інше)",patient.genCerebralOther);
+  add("Спінальний",patient.genSpinal?.join(", ")||(gc.spinal>0?`${gc.spinal} дескр.`:""));
+  if(patient.genSpinalOther) add("Спін. (інше)",patient.genSpinalOther);
+  add("Психогенний",patient.genPsychogenic?.join(", ")||(gc.psychogenic>0?`${gc.psychogenic} дескр.`:""));
+  if(patient.genPsychogenicOther) add("Психог. (інше)",patient.genPsychogenicOther);
+  children.push(...rows.splice(0));
+  children.push(Sep());
+
+  // ══ 5. ТЕСТИ ══
+  children.push(H1("5. КЛІНІЧНІ ТЕСТИ"));
+  const fmtTests=(data)=>Object.entries(data||{}).filter(([,v])=>v&&v.selected).map(([k,v])=>`${k}${v.reactions&&v.reactions.length?": "+v.reactions.join(", "):""}`).join("\n");
+  add("Церебральні тести",fmtTests(patient.cerebTests));
+  add("Периферичні тести",fmtTests(patient.perTests));
+  add("Психогенні тести",fmtTests(patient.psyTests));
+  children.push(...rows.splice(0));
+  children.push(Sep());
+
+  // ══ 6. ПСИХІЧНИЙ СТАН ══
+  children.push(H1("6. ПСИХІЧНИЙ СТАН"));
+  add("Сон (год.)",patient.sleepH);
+  add("Засинання",patient.sleepOn);
+  add("Пробудження",patient.sleepCont);
+  add("Нічні жахи",patient.nightm);
+  if(patient.sleepOther) add("Сон (інше)",patient.sleepOther);
+  add("Вживання ПАР",patient.subst);
+  add("Куріння",patient.smoke);
+  add("Суїцидальні думки",patient.suic);
+  add("Психотичні розл.",patient.psych);
+  add("Досвід",( patient.exp||[]).join(", "));
+  add("Симптоматика",(patient.sym||[]).join(", "));
+  add("MoCA",patient.moca?`${patient.moca}/30 — ${iMoCA(+patient.moca).t}`:"");
+  children.push(...rows.splice(0));
+  children.push(Sep());
+
+  // ══ 7. ОПИТУВАННЯ ══
+  children.push(H1("7. ІСТОРІЯ ОПИТУВАНЬ"));
+  if(asms.length===0){
+    children.push(P("Опитувань не проводилось"));
+  } else {
+    asms.forEach((a,idx)=>{
+      children.push(H2(`Опитування ${idx+1} — ${a.date}`));
+      if(a.pcl5!=null){const i=iPCL5(a.pcl5);add("PCL-5",`${a.pcl5}/80 — ${i.t}`);}
+      if(a.hadsT!=null&&a.hadsD!=null){
+        const ih=iHADS(a.hadsT,a.hadsD);
+        add("HADS Тривога",`${a.hadsT}/21 — ${ih.t.t}`);
+        add("HADS Депресія",`${a.hadsD}/21 — ${ih.d.t}`);
+      }
+      if(a.ais!=null){add("AIS",`${a.ais}/24 — ${iAIS(a.ais).t}`);}
+      if(a.dn4!=null){add("DN-4",`${a.dn4}/10 — ${iDN4(a.dn4).t}`);}
+      if(a.moca!=null&&a.moca!==""){add("MoCA (опит.)",`${a.moca}/30`);}
+      children.push(...rows.splice(0));
+    });
+  }
+  children.push(Sep());
+
+  // ══ 8. ЗАКЛЮЧЕННЯ ══
+  children.push(H1("8. ПСИХОЛОГІЧНЕ ЗАКЛЮЧЕННЯ"));
+  const concText=conclusionText||patient.conclusion||"";
+  if(concText){
+    concText.split("\n").forEach(line=>{
+      children.push(new Paragraph({
+        children:[new TextRun({text:line,size:22})],
+        spacing:{after:60}
+      }));
+    });
+  } else {
+    children.push(P("Заключення не сформовано"));
+  }
+  if(patient.recs){
+    children.push(H2("Рекомендації"));
+    children.push(P(patient.recs));
+  }
+
+  // ══ ПІДПИС ══
+  children.push(new Paragraph({text:"",spacing:{before:600}}));
+  children.push(new Paragraph({
+    children:[new TextRun({text:"Психолог Є. Іордек",size:22})],
+    spacing:{after:60}
+  }));
+  children.push(new Paragraph({
+    children:[new TextRun({text:`Дата: ${new Date().toLocaleDateString("uk-UA")}`,size:22})],
+  }));
+
+  const doc=new Document({
+    styles:{default:{document:{run:{font:"Times New Roman",size:24,language:{value:"uk-UA"}}}}},
+    sections:[{
+      properties:{page:{margin:{top:1080,right:1080,bottom:1080,left:1440}}},
+      children
+    }]
+  });
+
+  const blob=await Packer.toBlob(doc);
+  const fname=`${patient.name||"Пацієнт"}_${new Date().toLocaleDateString("uk-UA").replace(/\./g,"-")}.docx`;
+  saveAs(blob,fname);
+}
+
+// ═══ CONCLUSION COMPONENTS (module-level, stable references) ═══
+function PhraseBtn({label,onAdd}){
+  return <button onClick={()=>onAdd(label)} style={{padding:"5px 10px",borderRadius:8,border:"1px solid #2e3038",background:"#1a1c24",color:"#c8a2ff",fontSize:11,cursor:"pointer",marginBottom:4,marginRight:4,textAlign:"left",lineHeight:1.3}}>{label}</button>;
+}
+function BlkSect({title,phrases,value,onChange}){
+  return <div style={{marginBottom:14,background:"#1a1c24",borderRadius:12,padding:"12px 14px",border:"1px solid #252830"}}>
+    <div style={{fontSize:11,fontWeight:700,color:"#666",marginBottom:8,textTransform:"uppercase",letterSpacing:"0.05em"}}>{title}</div>
+    <div style={{flexWrap:"wrap",display:"flex",marginBottom:8}}>
+      {phrases.map((p,i)=><PhraseBtn key={i} label={p} onAdd={v=>onChange((value?value+" ":"")+v)}/>)}
+    </div>
+    <textarea value={value} onChange={e=>onChange(e.target.value)}
+      placeholder="Тицяй кнопки або редагуй вручну..."
+      style={{width:"100%",minHeight:52,padding:"8px 10px",background:"#12131a",border:"1px solid #2e3038",borderRadius:8,color:"#e8e9ed",fontSize:12,resize:"vertical",outline:"none",fontFamily:"inherit",lineHeight:1.5,boxSizing:"border-box"}}
+      onFocus={e=>e.target.style.borderColor="#c8a2ff"} onBlur={e=>e.target.style.borderColor="#2e3038"}
+    />
+    {value&&<button onClick={()=>onChange("")} style={{fontSize:10,color:"#444",background:"none",border:"none",cursor:"pointer",marginTop:2}}>✕ очистити</button>}
+  </div>;
+}
+
+// ═══ MAIN APP ═══
+function App(){
+const[view,setView]=useState("list");
+const[pts,setPts]=useState([]);const[asms,setAsms]=useState([]);
+const[tfbSessions,setTfbSessions]=useState([]);
+const[cur,setCur]=useState(null);const[curA,setCurA]=useState(null);
+const[search,setSearch]=useState("");const[loading,setLoading]=useState(true);
+const[fTab,setFTab]=useState(0);const[aTab,setATab]=useState(0);
+const ref=useRef();
+// ── Drive state ──
+const[driveReady,setDriveReady]=useState(false);
+const[driveStatus,setDriveStatus]=useState("idle"); // idle|syncing|saved|error|login
+const[driveLogging,setDriveLogging]=useState(false);
+
+// Drive status callback
+GDRIVE.onStatusChange=(s)=>setDriveStatus(s);
+
+// On mount: try to restore session, else show login
+useEffect(()=>{(async()=>{
+  const restored=await GDRIVE.init();
+  if(restored){
+    setDriveReady(true);
+    await loadFromDrive();
+  } else {
+    setDriveStatus("login");
+    setLoading(false);
+  }
+})()},[]);
+
+const loadFromDrive=async()=>{
+  setLoading(true);
+  try{
+    const data=await GDRIVE.readDB();
+    if(data){
+      setPts(data.patients||[]);
+      setAsms(data.assessments||[]);
+      setTfbSessions(data.tfb_sessions||[]);
+    }
+  }catch(e){console.error("Drive read error:",e);}
+  finally{setLoading(false);}
+};
+
+const syncToDrive=async(newPts,newAsms,newTfb)=>{
+  await GDRIVE.writeDB({
+    patients:newPts!==undefined?newPts:pts,
+    assessments:newAsms!==undefined?newAsms:asms,
+    tfb_sessions:newTfb!==undefined?newTfb:tfbSessions,
+    updatedAt:new Date().toISOString()
+  });
+};
+
+const handleDriveLogin=async()=>{
+  setDriveLogging(true);
+  const ok=await GDRIVE.login();
+  if(ok){
+    setDriveReady(true);
+    setDriveStatus("idle");
+    await loadFromDrive();
+  } else {
+    setDriveLogging(false);
+    setDriveStatus("login");
+  }
+};
+
+// ── conclusion hooks (must be at top level) ──
+const[cBlk,setCBlk]=useState({orient:"",complaints:"",anamn:"",cogn:"",emot:"",sleep:"",pain:"",genesis:"",recs:""});
+const[cFinalText,setCFinalText]=useState("");
+const[cCopied,setCCopied]=useState(false);
+const[cSaved,setCSaved]=useState(false);
+
+useEffect(()=>{if(!driveReady)return;(async()=>{try{setPts(await dbAll("patients"));setAsms(await dbAll("assessments"));setTfbSessions(await dbAll("tfb_sessions"))}catch(e){console.error("IndexedDB init error:",e)}finally{setLoading(false)}})()},[driveReady]);
+const saveP=async p=>{await dbPut("patients",p);const newPts=pts=>{const i=pts.findIndex(x=>x.id===p.id);let n;if(i>=0){n=[...pts];n[i]=p;}else{n=[...pts,p];}syncToDrive(n,undefined,undefined);return n;};setPts(newPts);};
+const saveTFB=async s=>{await dbPut("tfb_sessions",s);setTfbSessions(prev=>{const i=prev.findIndex(x=>x.id===s.id);let n;if(i>=0){n=[...prev];n[i]=s;}else{n=[...prev,s];}syncToDrive(undefined,undefined,n);return n;});};
+const delTFB=async id=>{await dbDel("tfb_sessions",id);setTfbSessions(p=>{const n=p.filter(x=>x.id!==id);syncToDrive(undefined,undefined,n);return n;});};
+const delP=async id=>{await dbDel("patients",id);const nPts=pts.filter(x=>x.id!==id);const nAsms=asms.filter(x=>x.pid!==id);setPts(nPts);for(const a of asms.filter(a=>a.pid===id))await dbDel("assessments",a.id);setAsms(nAsms);syncToDrive(nPts,nAsms,undefined);setView("list")};
+const saveA=async a=>{await dbPut("assessments",a);setAsms(prev=>{const i=prev.findIndex(x=>x.id===a.id);let n;if(i>=0){n=[...prev];n[i]=a;}else{n=[...prev,a];}syncToDrive(undefined,n,undefined);return n;});};
+const fPts=useMemo(()=>{let r=pts;if(search){const s=search.toLowerCase();r=r.filter(p=>p.name?.toLowerCase().includes(s)||p.unit?.toLowerCase().includes(s))}return r.sort((a,b)=>new Date(b.createdAt)-new Date(a.createdAt))},[pts,search]);
+const pAsms=useMemo(()=>cur?asms.filter(a=>a.pid===cur.id).sort((a,b)=>b.date>a.date?1:-1):[],[cur,asms]);
+const go=v=>{setView(v);if(ref.current)ref.current.scrollTop=0};
+// ── Login screen ──
+if(driveStatus==="login"&&!driveReady)return <div style={{minHeight:"100vh",background:"#12131a",display:"flex",alignItems:"center",justifyContent:"center",flexDirection:"column",gap:20,padding:24}}>
+  <div style={{fontSize:32}}>🔒</div>
+  <div style={{fontSize:20,fontWeight:700,color:"#e8e9ed"}}>Phantom Registry</div>
+  <div style={{fontSize:13,color:"#666",textAlign:"center",maxWidth:280}}>Дані зберігаються у твоєму Google Drive. Увійди щоб отримати доступ.</div>
+  <button onClick={handleDriveLogin} disabled={driveLogging}
+    style={{padding:"14px 32px",borderRadius:14,border:"none",background:driveLogging?"#2e3038":"linear-gradient(135deg,#c8a2ff,#8b5cf6)",color:"#fff",fontWeight:700,fontSize:16,cursor:driveLogging?"not-allowed":"pointer",minWidth:200}}>
+    {driveLogging?"Підключення...":"🔑 Увійти через Google"}
+  </button>
+  <div style={{fontSize:11,color:"#444",textAlign:"center",maxWidth:260}}>Дозволь доступ до Google Drive. Буде створено один файл: phantom_registry_db.json</div>
+</div>;
+
+if(loading)return <div style={{minHeight:"100vh",background:"#12131a",display:"flex",alignItems:"center",justifyContent:"center",flexDirection:"column",gap:12}}>
+  <div style={{fontSize:24}}>☁️</div>
+  <span style={{color:"#c8a2ff"}}>Завантаження з Google Drive...</span>
+</div>;
+
+const W={height:"100vh",background:"#12131a",color:"#e8e9ed",maxWidth:800,margin:"0 auto",display:"flex",flexDirection:"column",overflow:"hidden",position:"relative"};
+const SC={flex:1,overflowY:"auto",WebkitOverflowScrolling:"touch"};
+
+// ═══ LIST ═══
+if(view==="list")return <div style={W}><div style={S.hdr}><div style={{flex:1}}><h1 style={{fontSize:20,fontWeight:800}}><span style={{color:"#c8a2ff"}}>Реєстр</span> пацієнтів</h1><div style={{fontSize:11,color:"#555",marginTop:2}}>{pts.length} записів</div></div>
+<div style={{display:"flex",alignItems:"center",gap:6}}>
+{driveStatus==="syncing"&&<span style={{fontSize:11,color:"#e9c46a"}}>☁ sync...</span>}
+{driveStatus==="saved"&&<span style={{fontSize:11,color:"#2a9d8f"}}>☁ ✓</span>}
+{driveStatus==="error"&&<span style={{fontSize:11,color:"#e76f51"}} onClick={()=>syncToDrive()} title="Повторити">☁ ✗</span>}
+<Btn v="s" style={{padding:"8px 12px"}} onClick={()=>exportCSV(pts,asms)}>⬇ CSV</Btn>
+</div></div>
+<div style={SC} ref={ref}><div style={{padding:"10px 16px"}}><input placeholder="🔍 Пошук..." value={search} onChange={e=>setSearch(e.target.value)} style={{...S.inp,padding:"10px 12px"}}/></div>
+<div style={{padding:"0 16px 100px"}}>{fPts.length===0?<div style={{textAlign:"center",padding:"50px 20px"}}><div style={{fontSize:44,marginBottom:8}}>📋</div><div style={{color:"#555",fontSize:13}}>Немає пацієнтів</div></div>:fPts.map(p=>{
+const la=asms.filter(a=>a.pid===p.id).sort((a,b)=>b.date>a.date?1:-1)[0];
+const gc=calcGenesis(p);
+const ampStr=Object.entries(p.amps||{}).filter(([,v])=>v.level).map(([k])=>LIMBS[k]?.short).join(", ");
+return <div key={p.id} onClick={()=>{setCur(p);go("detail")}} style={S.card}>
+<div style={{display:"flex",justifyContent:"space-between",alignItems:"start"}}>
+<div><div style={{fontWeight:700,fontSize:15,marginBottom:2}}>{p.name||"Без імені"}</div>
+<div style={{fontSize:12,color:"#666"}}>{ampStr&&<span>{ampStr} • </span>}{p.unit&&<span>В/Ч {p.unit}</span>}{gc.dominant!=="—"&&<span style={{color:"#c8a2ff"}}> • {gc.dominant}</span>}</div></div>
+<div style={{textAlign:"right"}}>
+{p.hasFB&&p.fbVAS>0&&<div style={{fontSize:11,padding:"2px 8px",borderRadius:10,background:`rgba(${p.fbVAS>6?"231,111,81":p.fbVAS>3?"233,196,106":"42,157,143"},0.2)`,color:vc(p.fbVAS),fontWeight:600}}>ФБ:{p.fbVAS}</div>}
+{la?.pcl5!=null&&<div style={{fontSize:11,color:iPCL5(la.pcl5).c,marginTop:2}}>PCL-5:{la.pcl5}</div>}
+</div></div></div>})}</div></div>
+<button onClick={()=>{setCur(defP());setFTab(0);go("form")}} style={{position:"fixed",bottom:24,right:24,width:60,height:60,borderRadius:16,background:"#c8a2ff",border:"none",cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center",boxShadow:"0 4px 20px rgba(200,162,255,0.4)",fontSize:30,color:"#12131a",zIndex:9999}}>+</button></div>;
+
+// ═══ FORM ═══
+if(view==="form"&&cur){
+const u=(f,v)=>setCur({...cur,[f]:v});
+const tabs=["Паспорт","Ампутація","Біль/Відч","Генез","Тести","Стан","ТФБ","Секс.ф-я","Об'єктивні","Згода"];
+return <div style={W}><div style={S.hdr}>
+<button onClick={()=>go("detail")} style={{background:"none",border:"none",cursor:"pointer",color:"#c8a2ff",fontSize:20,padding:4}}>←</button>
+<h2 style={{fontSize:16,fontWeight:700,flex:1}}>{cur.name||"Новий пацієнт"}</h2>
+<Btn onClick={()=>{saveP(cur);go("detail")}} style={{padding:"8px 14px"}}>✓</Btn>
+</div>
+<div style={{display:"flex",overflow:"auto",gap:3,padding:"6px 12px",borderBottom:"1px solid #1e2028",flexShrink:0}}>{tabs.map((t,i)=><button key={i} onClick={()=>setFTab(i)} style={{...S.tab,background:fTab===i?"rgba(200,162,255,0.15)":"transparent",color:fTab===i?"#c8a2ff":"#555",fontWeight:fTab===i?600:400}}>{t}</button>)}</div>
+<div style={SC} ref={ref}><div style={{padding:"14px 16px 80px"}}>
+
+{fTab===0&&<>
+<Inp label="ПІП" value={cur.name} onChange={e=>u("name",e.target.value)} placeholder="Прізвище Ім'я По-батькові"/>
+<div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
+<Inp label="Вік" type="number" value={cur.age} onChange={e=>u("age",e.target.value)}/>
+<div style={{marginBottom:14}}><label style={S.lbl}>Стать</label><div style={{display:"flex",gap:4}}>{["Ч","Ж"].map(s=><button key={s} onClick={()=>u("sex",s)} style={{flex:1,padding:"10px",borderRadius:8,border:"1px solid "+(cur.sex===s?"#c8a2ff":"#2e3038"),background:cur.sex===s?"rgba(200,162,255,0.15)":"#1e2028",color:cur.sex===s?"#c8a2ff":"#666",cursor:"pointer",fontWeight:600}}>{s}</button>)}</div></div>
+<Inp label="В/Ч" value={cur.unit} onChange={e=>u("unit",e.target.value)} placeholder="А____"/>
+<Inp label="Палата №" value={cur.ward} onChange={e=>u("ward",e.target.value)}/>
+<Inp label="Дата поранення" type="date" value={cur.injDate} onChange={e=>u("injDate",e.target.value)}/>
+<Inp label="Дата ампутації" type="date" value={cur.ampDate} onChange={e=>u("ampDate",e.target.value)}/>
+<Inp label="Дата поступлення" type="date" value={cur.admDate} onChange={e=>u("admDate",e.target.value)}/>
+<Inp label="Дата реамп." type="date" value={cur.reampDate} onChange={e=>u("reampDate",e.target.value)}/>
+</div>
+<Inp label="Тип ампутації" value={cur.ampType} onChange={e=>u("ampType",e.target.value)} placeholder="Травматична / хірургічна..."/>
+<div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
+<div style={{marginBottom:14}}><label style={S.lbl}>Критика до стану</label><div style={{display:"flex",gap:4}}>{["Зниж.","Відпов."].map(s=><button key={s} onClick={()=>u("crit",s)} style={{flex:1,padding:"8px",borderRadius:8,border:"1px solid "+(cur.crit===s?"#c8a2ff":"#2e3038"),background:cur.crit===s?"rgba(200,162,255,0.15)":"#1e2028",color:cur.crit===s?"#c8a2ff":"#666",cursor:"pointer",fontSize:11}}>{s}</button>)}</div></div>
+<div style={{marginBottom:14}}><label style={S.lbl}>Увага конц.</label><div style={{display:"flex",gap:4}}>{["Пошк.","Біль","Реставр."].map(s=><button key={s} onClick={()=>u("attn",s)} style={{flex:1,padding:"7px",borderRadius:8,border:"1px solid "+(cur.attn===s?"#c8a2ff":"#2e3038"),background:cur.attn===s?"rgba(200,162,255,0.15)":"#1e2028",color:cur.attn===s?"#c8a2ff":"#666",cursor:"pointer",fontSize:10}}>{s}</button>)}</div></div>
+</div>
+<TArea label="Скарги" value={cur.complaints} onChange={e=>u("complaints",e.target.value)}/>
+</>}
+
+{fTab===1&&<>
+<Sect title="Рівень ампутації (по кінцівках)">
+<p style={{fontSize:11,color:"#666",marginBottom:10}}>Оберіть кінцівку → рівень → третину</p>
+<AmpSelector limbs={LIMBS} amps={cur.amps||{}} onChange={v=>u("amps",v)}/>
+</Sect>
+<Sect title="RPNI"><Toggle label="RPNI виконано" value={cur.rpni} onChange={v=>u("rpni",v)}/></Sect>
+<Sect title="Наявність">
+<div style={{display:"flex",flexWrap:"wrap",gap:8}}>
+<Toggle label="Фантомний біль (Ф.Б.)" value={cur.hasFB} onChange={v=>u("hasFB",v)}/>
+<Toggle label="Фантомні відчуття (Ф.В.)" value={cur.hasFV} onChange={v=>u("hasFV",v)}/>
+<Toggle label="Біль кукси (Б.К.)" value={cur.hasBK} onChange={v=>u("hasBK",v)}/>
+</div>
+</Sect>
+</>}
+
+{fTab===2&&<>
+{!cur.hasFB&&!cur.hasFV&&!cur.hasBK&&<div style={{textAlign:"center",padding:"30px",color:"#555",fontSize:13}}>Відмітьте ФБ/ФВ/БК на вкладці «Ампутація»</div>}
+{cur.hasFB&&<Sect title="Фантомний біль (Ф.Б.)" color="#e76f51">
+<Inp label="Локалізація" value={cur.fbLoc} onChange={e=>u("fbLoc",e.target.value)}/>
+<VAS label="VAS" value={cur.fbVAS} onChange={v=>u("fbVAS",v)}/>
+<DailyRhythm data={cur.fbRhythm||{}} onChange={v=>u("fbRhythm",v)} label="Ф.Б."/>
+</Sect>}
+{cur.hasFV&&<Sect title="Фантомні відчуття (Ф.В.)" color="#64b5f6">
+<Inp label="Локалізація" value={cur.fvLoc} onChange={e=>u("fvLoc",e.target.value)}/>
+<VAS label="VAS" value={cur.fvVAS} onChange={v=>u("fvVAS",v)}/>
+<DailyRhythm data={cur.fvRhythm||{}} onChange={v=>u("fvRhythm",v)} label="Ф.В."/>
+</Sect>}
+{cur.hasBK&&<Sect title="Біль кукси (Б.К.)" color="#f4a261">
+<Inp label="Локалізація" value={cur.bkLoc} onChange={e=>u("bkLoc",e.target.value)}/>
+<VAS label="VAS" value={cur.bkVAS} onChange={v=>u("bkVAS",v)}/>
+<DailyRhythm data={cur.bkRhythm||{}} onChange={v=>u("bkRhythm",v)} label="Б.К."/>
+</Sect>}
+
+<Sect title="Патологія кукси" color="#f4a261">
+<p style={{fontSize:11,color:"#888",marginBottom:10}}>Структурні патології, що можуть бути джерелом периферичного болю</p>
+<div style={{display:"flex",flexWrap:"wrap",gap:6,marginBottom:12}}>
+{STUMP_PATH.map(item=>{
+  const sel=(cur.stumpPath||[]).includes(item);
+  return <button key={item} onClick={()=>{const arr=cur.stumpPath||[];u("stumpPath",sel?arr.filter(x=>x!==item):[...arr,item]);}}
+    style={{padding:"6px 11px",borderRadius:8,border:"1px solid "+(sel?"#f4a261":"#2e3038"),
+    background:sel?"rgba(244,162,97,0.15)":"#1e2028",color:sel?"#f4a261":"#666",
+    fontSize:12,cursor:"pointer",textAlign:"left"}}>
+    {sel?"✓ ":""}{item}
+  </button>;
+})}
+</div>
+<div style={{marginBottom:10}}>
+  <label style={S.lbl}>Джерело виявлення</label>
+  <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+  {["Зі слів пацієнта","UZD/Рентген/КТ","Пальпація/тестування","З медичної документації"].map(s=>{
+    const sel=(cur.stumpPathSource||[]).includes(s);
+    return <button key={s} onClick={()=>{const arr=cur.stumpPathSource||[];u("stumpPathSource",sel?arr.filter(x=>x!==s):[...arr,s]);}}
+      style={{padding:"6px 11px",borderRadius:8,border:"1px solid "+(sel?"#64b5f6":"#2e3038"),
+      background:sel?"rgba(100,181,246,0.15)":"#1e2028",color:sel?"#64b5f6":"#666",
+      fontSize:12,cursor:"pointer"}}>
+      {sel?"✓ ":""}{s}
+    </button>;
+  })}
+  </div>
+</div>
+<div style={{marginBottom:4}}><label style={S.lbl}>Примітка</label>
+<textarea value={cur.stumpPathNote||""} onChange={e=>u("stumpPathNote",e.target.value)}
+  placeholder="Локалізація, деталі, дата виявлення..."
+  style={{width:"100%",minHeight:60,padding:"8px 10px",background:"#12131a",border:"1px solid #2e3038",
+  borderRadius:8,color:"#e8e9ed",fontSize:12,resize:"vertical",outline:"none",fontFamily:"inherit",
+  lineHeight:1.5,boxSizing:"border-box"}}
+  onFocus={e=>e.target.style.borderColor="#f4a261"} onBlur={e=>e.target.style.borderColor="#2e3038"}/>
+</div>
+{(cur.stumpPath||[]).length>0&&<div style={{marginTop:6,padding:"6px 10px",background:"rgba(244,162,97,0.08)",borderRadius:6,fontSize:11,color:"#f4a261"}}>
+  Виявлено: {(cur.stumpPath||[]).join(", ")}
+  {(cur.stumpPathSource||[]).length>0&&<span style={{color:"#64b5f6"}}> · {(cur.stumpPathSource||[]).join(", ")}</span>}
+</div>}
+</Sect>
+<Sect title="Характер протікання"><Chips opts={PAIN_FLOW} sel={cur.painFlow} onChange={v=>u("painFlow",v)}/></Sect>
+<div style={{marginBottom:14}}><label style={S.lbl}>Травм. спогади про поранення/біль</label><div style={{display:"flex",gap:6}}>{["Присутні","Відсутні"].map(s=><button key={s} onClick={()=>u("traumMem",s)} style={{flex:1,padding:"8px",borderRadius:8,border:"1px solid "+(cur.traumMem===s?"#c8a2ff":"#2e3038"),background:cur.traumMem===s?"rgba(200,162,255,0.15)":"#1e2028",color:cur.traumMem===s?"#c8a2ff":"#666",cursor:"pointer",fontSize:12}}>{s}</button>)}</div></div>
+<Sect title="Соматичні реакції на біль"><Chips opts={SOM_REACT} sel={cur.somReact} onChange={v=>u("somReact",v)}/></Sect>
+</>}
+
+{fTab===3&&<>
+<GenesisSummary patient={cur}/>
+{Object.entries(GENESIS).map(([key,gen])=><Sect key={key} title={gen.name} color={gen.color}>
+{gen.subtitle&&<p style={{fontSize:11,color:gen.color,marginBottom:8,fontStyle:"italic"}}>{gen.subtitle}</p>}
+<Chips opts={gen.desc} sel={cur["gen"+key.charAt(0).toUpperCase()+key.slice(1)]||[]} onChange={v=>u("gen"+key.charAt(0).toUpperCase()+key.slice(1),v)} color={gen.color}/>
+<TArea label="Інше" value={cur["gen"+key.charAt(0).toUpperCase()+key.slice(1)+"Other"]||""} onChange={e=>u("gen"+key.charAt(0).toUpperCase()+key.slice(1)+"Other",e.target.value)} style={{minHeight:50}}/>
+</Sect>)}
+</>}
+
+{fTab===4&&<>
+<p style={{fontSize:11,color:"#666",marginBottom:12}}>Оберіть тести → вкажіть реакцію</p>
+<Sect title="Церебральні тести"><TestReact tests={CEREBRAL_TESTS} data={cur.cerebTests||{}} onChange={v=>u("cerebTests",v)}/></Sect>
+<Sect title="Периферичні тести"><TestReact tests={PERIPHERAL_TESTS} data={cur.perTests||{}} onChange={v=>u("perTests",v)}/></Sect>
+<Sect title="Психогенні тести"><TestReact tests={PSYCHOGENIC_TESTS} data={cur.psyTests||{}} onChange={v=>u("psyTests",v)}/></Sect>
+</>}
+
+{fTab===5&&<>
+<Sect title="Сон">
+<div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
+<Inp label="К-сть годин" value={cur.sleepH} onChange={e=>u("sleepH",e.target.value)}/>
+<div style={{marginBottom:14}}><label style={S.lbl}>Засинання</label><div style={{display:"flex",gap:4}}>{["Норм","Утруднене"].map(s=><button key={s} onClick={()=>u("sleepOn",s)} style={{flex:1,padding:"8px",borderRadius:8,border:"1px solid "+(cur.sleepOn===s?"#c8a2ff":"#2e3038"),background:cur.sleepOn===s?"rgba(200,162,255,0.15)":"#1e2028",color:cur.sleepOn===s?"#c8a2ff":"#666",cursor:"pointer",fontSize:11}}>{s}</button>)}</div></div>
+</div>
+<div style={{marginBottom:14}}><label style={S.lbl}>Пробудження</label><div style={{display:"flex",gap:4,flexWrap:"wrap"}}>{["Без пробудж.","З пробудж.","Біль будить"].map(s=><button key={s} onClick={()=>u("sleepCont",s)} style={{padding:"8px 10px",borderRadius:8,border:"1px solid "+(cur.sleepCont===s?"#c8a2ff":"#2e3038"),background:cur.sleepCont===s?"rgba(200,162,255,0.15)":"#1e2028",color:cur.sleepCont===s?"#c8a2ff":"#666",cursor:"pointer",fontSize:11}}>{s}</button>)}</div></div>
+<div style={{display:"flex",gap:8,marginBottom:14}}><div style={{flex:1}}><label style={S.lbl}>Нічні жахи</label><div style={{display:"flex",gap:4}}>{["Так","Ні"].map(s=><button key={s} onClick={()=>u("nightm",s)} style={{flex:1,padding:"8px",borderRadius:8,border:"1px solid "+(cur.nightm===s?"#c8a2ff":"#2e3038"),background:cur.nightm===s?"rgba(200,162,255,0.15)":"#1e2028",color:cur.nightm===s?"#c8a2ff":"#666",cursor:"pointer",fontSize:12}}>{s}</button>)}</div></div></div>
+<Inp label="Інші порушення сну" value={cur.sleepOther} onChange={e=>u("sleepOther",e.target.value)}/>
+</Sect>
+<Sect title="ПАР / Ризики">
+<label style={S.lbl}>Вживання ПАР</label>
+<Chips opts={["Відсутнє","Залежність","Епізодичне","Зловживав раніше"]} sel={cur.subst?[cur.subst]:[]} onChange={v=>u("subst",v[0]||"")} multi={false}/>
+<div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:8,marginBottom:14}}>
+{[{l:"Куріння",f:"smoke"},{l:"Суїцид. думки",f:"suic"},{l:"Психот. розл.",f:"psych"}].map(({l,f})=><div key={f}><label style={{...S.lbl,fontSize:10}}>{l}</label><div style={{display:"flex",gap:3}}>{["Так","Ні"].map(s=><button key={s} onClick={()=>u(f,s)} style={{flex:1,padding:"6px",borderRadius:6,border:"1px solid "+(cur[f]===s?(s==="Так"?"#e76f51":"#2a9d8f"):"#2e3038"),background:cur[f]===s?(s==="Так"?"rgba(231,111,81,0.15)":"rgba(42,157,143,0.15)"):"#1e2028",color:cur[f]===s?(s==="Так"?"#e76f51":"#2a9d8f"):"#666",cursor:"pointer",fontSize:11,fontWeight:600}}>{s}</button>)}</div></div>)}</div>
+</Sect>
+<Sect title="Досвід пацієнта"><Chips opts={EXP_OPT} sel={cur.exp} onChange={v=>u("exp",v)}/></Sect>
+<Sect title="Симптоматика"><Chips opts={SYM_OPT} sel={cur.sym} onChange={v=>u("sym",v)}/></Sect>
+</>}
+
+{fTab===6&&<TFBSessionsView pid={cur.id} tfbSessions={tfbSessions} saveTFB={saveTFB} delTFB={delTFB}/>}
+
+{fTab===7&&<SexualFunctionForm cur={cur} u={u}/>}
+
+{fTab===8&&<ObjectiveForm cur={cur} u={u}/>}
+
+{fTab===9&&<ConsentForm cur={cur} u={u}/>}
+
+</div></div></div>}
+
+// ═══ DETAIL ═══
+if(view==="detail"&&cur){
+const ampStr=Object.entries(cur.amps||{}).filter(([,v])=>v.level).map(([k,v])=>`${LIMBS[k]?.short}: ${v.level}${v.sub?" ("+v.sub+")":""}`);
+const gc=calcGenesis(cur);
+return <div style={W}><div style={S.hdr}>
+<button onClick={()=>go("list")} style={{background:"none",border:"none",cursor:"pointer",color:"#c8a2ff",fontSize:20,padding:4}}>←</button>
+<h2 style={{fontSize:16,fontWeight:700,flex:1}}>{cur.name||"Пацієнт"}</h2>
+<Btn v="s" style={{padding:"8px 12px"}} onClick={()=>{setFTab(0);go("form")}}>✎</Btn>
+</div><div style={SC} ref={ref}><div style={{padding:"14px 16px 80px"}}>
+<div style={{...S.card,cursor:"default"}}><div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,fontSize:13}}>
+{cur.age&&<div><span style={{color:"#555"}}>Вік: </span>{cur.age}, {cur.sex}</div>}
+{cur.unit&&<div><span style={{color:"#555"}}>В/Ч: </span>А{cur.unit}</div>}
+{cur.ampDate&&<div><span style={{color:"#555"}}>Дата амп.: </span>{cur.ampDate}</div>}
+{cur.injDate&&<div><span style={{color:"#555"}}>Поранення: </span>{cur.injDate}</div>}
+<div><span style={{color:"#555"}}>RPNI: </span>{cur.rpni?"Так":"Ні"}</div>
+<div><span style={{color:"#555"}}>Згода: </span><span style={{color:cur.consentGiven?"#2a9d8f":"#e76f51",fontWeight:600}}>{cur.consentGiven?"Надана":"Не підписана"}</span></div>
+</div>
+{ampStr.length>0&&<div style={{marginTop:10,borderTop:"1px solid #252830",paddingTop:10}}><div style={{fontSize:11,color:"#666",marginBottom:4}}>Ампутації:</div>{ampStr.map((s,i)=><div key={i} style={{fontSize:13,color:"#c8a2ff",marginBottom:2}}>{s}</div>)}</div>}
+</div>
+
+{(cur.hasFB||cur.hasFV||cur.hasBK)&&<div style={{...S.card,cursor:"default"}}>
+<div style={{fontSize:13,fontWeight:600,marginBottom:10,color:"#c8a2ff"}}>Больовий профіль</div>
+<div style={{display:"flex",gap:12,justifyContent:"space-around"}}>
+{[{l:"Ф.Б.",v:cur.fbVAS,has:cur.hasFB},{l:"Ф.В.",v:cur.fvVAS,has:cur.hasFV},{l:"Б.К.",v:cur.bkVAS,has:cur.hasBK}].filter(x=>x.has).map(({l,v})=><div key={l} style={{textAlign:"center"}}>
+<div style={{width:46,height:46,borderRadius:12,display:"flex",alignItems:"center",justifyContent:"center",background:`rgba(${v>6?"231,111,81":v>3?"233,196,106":"42,157,143"},0.15)`,color:vc(v),fontSize:20,fontWeight:800,margin:"0 auto 4px"}}>{v}</div>
+<div style={{fontSize:11,color:"#777"}}>{l}</div></div>)}</div></div>}
+
+<GenesisSummary patient={cur}/>
+
+<div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:14}}>
+<Btn v="s" onClick={()=>{setCurA({id:uid(),pid:cur.id,date:new Date().toISOString().slice(0,10),pcl5A:Array(20).fill(null),hadsA:Array(14).fill(null),aisA:Array(8).fill(null),dn4A:Array(10).fill(null),moca:"",pcl5:null,hadsT:null,hadsD:null,ais:null,dn4:null});setATab(0);go("assessment")}} style={{justifyContent:"center"}}>📋 Опитування</Btn>
+<Btn v="s" onClick={()=>go("charts")} style={{justifyContent:"center"}}>📊 Графіки</Btn>
+<Btn v="s" onClick={()=>go("conclusion")} style={{justifyContent:"center",gridColumn:"1/-1",background:"rgba(200,162,255,0.08)",borderColor:"rgba(200,162,255,0.5)"}}>📝 Заключення</Btn>
+<Btn v="s" onClick={()=>exportWordDoc(cur,asms)} style={{justifyContent:"center",gridColumn:"1/-1",background:"rgba(42,157,143,0.08)",borderColor:"rgba(42,157,143,0.4)",color:"#2a9d8f"}}>📄 Експорт в Word</Btn>
+</div>
+
+<div style={{fontSize:13,fontWeight:600,marginBottom:8,color:"#8a8f98"}}>Історія опитувань</div>
+{pAsms.length===0?<div style={{color:"#444",fontSize:13,padding:12,textAlign:"center"}}>Немає опитувань</div>:pAsms.map(a=><div key={a.id} style={{padding:12,background:"#1a1c24",borderRadius:10,marginBottom:6,border:"1px solid #252830",display:"flex",justifyContent:"space-between",alignItems:"center"}}><div><div style={{fontSize:13,fontWeight:600}}>{a.date}</div><div style={{fontSize:11,color:"#666",marginTop:2}}>{a.pcl5!=null&&<span style={{color:iPCL5(a.pcl5).c}}>PCL-5:{a.pcl5} </span>}{a.hadsT!=null&&<span style={{color:iHADS(a.hadsT,a.hadsD).t.c}}>Т:{a.hadsT} </span>}{a.hadsD!=null&&<span style={{color:iHADS(a.hadsT,a.hadsD).d.c}}>Д:{a.hadsD} </span>}{a.ais!=null&&<span style={{color:iAIS(a.ais).c}}>AIS:{a.ais} </span>}{a.dn4!=null&&<span style={{color:iDN4(a.dn4).c}}>DN4:{a.dn4}</span>}</div></div><button onClick={()=>{setCurA(a);setATab(0);go("assessment")}} style={{background:"none",border:"none",cursor:"pointer",color:"#555",fontSize:18}}>›</button></div>)}
+
+<div style={{marginTop:40,textAlign:"center"}}><Btn v="d" onClick={()=>{if(confirm("Видалити пацієнта?"))delP(cur.id)}}>🗑 Видалити</Btn></div>
+</div></div></div>}
+
+// ═══ ASSESSMENT ═══
+if(view==="assessment"&&curA){
+const computeSave=()=>{const pcl5=curA.pcl5A.filter(a=>a!==null).reduce((s,v)=>s+v,0);const hadsT=HADS.reduce((s,h,i)=>h.s==="Т"&&curA.hadsA[i]!==null?s+h.sc[curA.hadsA[i]]:s,0);const hadsD=HADS.reduce((s,h,i)=>h.s==="Д"&&curA.hadsA[i]!==null?s+h.sc[curA.hadsA[i]]:s,0);const ais=curA.aisA.filter(a=>a!==null).reduce((s,v)=>s+v,0);const dn4=curA.dn4A.filter(a=>a===1).length;saveA({...curA,pcl5,hadsT,hadsD,ais,dn4});go("detail")};
+return <div style={W}><div style={S.hdr}>
+<button onClick={()=>go("detail")} style={{background:"none",border:"none",cursor:"pointer",color:"#c8a2ff",fontSize:20,padding:4}}>←</button>
+<h2 style={{fontSize:16,fontWeight:700,flex:1}}>Опитування</h2>
+<Btn onClick={computeSave} style={{padding:"8px 14px"}}>✓</Btn>
+</div>
+<div style={{padding:"6px 16px",flexShrink:0}}><Inp label="Дата" type="date" value={curA.date} onChange={e=>setCurA({...curA,date:e.target.value})}/></div>
+<div style={{display:"flex",gap:4,padding:"0 16px 6px",borderBottom:"1px solid #1e2028",flexShrink:0,overflowX:"auto"}}>{["PCL-5","HADS","AIS","DN-4","MoCA"].map((t,i)=><button key={i} onClick={()=>setATab(i)} style={{flex:1,padding:"8px",borderRadius:8,border:"none",background:aTab===i?"rgba(200,162,255,0.15)":"transparent",color:aTab===i?"#c8a2ff":"#555",fontSize:12,fontWeight:aTab===i?700:400,cursor:"pointer",whiteSpace:"nowrap"}}>{t}</button>)}</div>
+<div style={SC} ref={ref}><div style={{padding:"14px 16px 80px"}}>
+{aTab===0&&<PCL5Form ans={curA.pcl5A} onChange={v=>setCurA({...curA,pcl5A:v})}/>}
+{aTab===1&&<HADSForm ans={curA.hadsA} onChange={v=>setCurA({...curA,hadsA:v})}/>}
+{aTab===2&&<AISForm ans={curA.aisA} onChange={v=>setCurA({...curA,aisA:v})}/>}
+{aTab===3&&<DN4Form ans={curA.dn4A} onChange={v=>setCurA({...curA,dn4A:v})}/>}
+{aTab===4&&<div>
+<p style={{fontSize:12,color:"#8a8f98",marginBottom:14}}>Введіть результат тесту MoCA (Монреальська когнітивна шкала)</p>
+<div style={{marginBottom:10}}><label style={{display:"block",fontSize:12,color:"#8a8f98",marginBottom:6,fontWeight:500}}>Загальний бал (0–30)</label>
+<input type="number" min="0" max="30" value={curA.moca||""} onChange={e=>setCurA({...curA,moca:e.target.value})} placeholder="0–30" style={{width:"100%",padding:"12px",background:"#1e2028",border:"1px solid #2e3038",borderRadius:8,color:"#e8e9ed",fontSize:18,textAlign:"center",outline:"none"}} onFocus={e=>e.target.style.borderColor="#c8a2ff"} onBlur={e=>e.target.style.borderColor="#2e3038"}/></div>
+{curA.moca!==""&&curA.moca!=null&&<div style={{padding:12,background:"#1e2028",borderRadius:10,textAlign:"center",fontSize:14}}>
+MoCA: <strong>{curA.moca}</strong>/30 — <span style={{color:iMoCA(+curA.moca).c,fontWeight:700}}>{iMoCA(+curA.moca).t}</span>
+</div>}
+</div>}
+</div></div></div>}
+
+// ═══ CHARTS ═══
+if(view==="charts"&&cur){const mk=k=>pAsms.filter(a=>a[k]!=null).reverse().map(a=>({d:a.date,v:a[k]}));
+return <div style={W}><div style={S.hdr}>
+<button onClick={()=>go("detail")} style={{background:"none",border:"none",cursor:"pointer",color:"#c8a2ff",fontSize:20,padding:4}}>←</button>
+<h2 style={{fontSize:16,fontWeight:700,flex:1}}>Динаміка</h2>
+</div><div style={SC} ref={ref}><div style={{padding:"14px 16px 40px"}}>
+<Chart data={mk("pcl5")} label="PCL-5 (норма≤20, РА 21-33, ПТСР≥33)" color="#e76f51"/>
+<Chart data={mk("hadsT")} label="HADS Тривога (норма≤7)" color="#e9c46a"/>
+<Chart data={mk("hadsD")} label="HADS Депресія (норма≤7)" color="#64b5f6"/>
+<Chart data={mk("ais")} label="AIS Безсоння (норма≤6)" color="#2a9d8f"/>
+<Chart data={mk("dn4")} label="DN-4 (нейропатичний≥4)" color="#f4a261"/>
+{!pAsms.length&&<div style={{textAlign:"center",padding:"40px",color:"#444"}}>Проведіть опитування</div>}
+</div></div></div>}
+
+// ═══ CONCLUSION ═══
+if(view==="conclusion"&&cur){
+const la=pAsms[0]||null;
+const gc=calcGenesis(cur);
+const today=new Date().toLocaleDateString("uk-UA");
+
+const cUpd=(k,v)=>setCBlk(b=>({...b,[k]:v}));
+const cApp=(k,v)=>setCBlk(b=>({...b,[k]:(b[k]?b[k]+" "+v:v)}));
+
+const ampStr2=Object.entries(cur.amps||{}).filter(([,v])=>v.level)
+  .map(([k,v])=>`${LIMBS[k]?.short}: ${v.level}${v.sub?" ("+v.sub+")":""}`)
+  .join(", ");
+
+const fbVAS=cur.hasFB?cur.fbVAS:null;
+const fvVAS=cur.hasFV?cur.fvVAS:null;
+const bkVAS=cur.hasBK?cur.bkVAS:null;
+const mocaVal=cur.moca!==""&&cur.moca!=null?+cur.moca:null;
+const mocaStr=mocaVal!=null?` (MoCA: ${mocaVal}/30 — ${iMoCA(mocaVal).t})`:"";
+const pcl5v=la?.pcl5??null;
+const hadsTv=la?.hadsT??null;
+const hadsDv=la?.hadsD??null;
+const aisv=la?.ais??null;
+const dn4v=la?.dn4??null;
+const emotScores=[
+  pcl5v!=null?`PCL-5: ${pcl5v}/80 (${iPCL5(pcl5v).t})`:"",
+  hadsTv!=null?`HADS-Т: ${hadsTv}/21 (${iHADS(hadsTv,hadsDv??0).t.t})`:"",
+  hadsDv!=null?`HADS-Д: ${hadsDv}/21 (${iHADS(hadsTv??0,hadsDv).d.t})`:"",
+].filter(Boolean).join("; ");
+
+const orientPhrases=["Алопсихічно та аутопсихічно орієнтований/а вірно.","Доступний/а продуктивному контакту.","Контакт формальний, по суті питань.","Поведінка впорядкована, відповідна ситуації.","Зовнішній вигляд охайний.","Вираз обличчя стриманий.","На запитання відповідає коротко, по суті.","Критика до стану збережена.","Критика до стану часткова."];
+const complaintPhrases=[...(cur.hasFB?[`Фантомний біль (ВАШ ${fbVAS}/10).`]:[]),...(cur.hasFV?[`Фантомні відчуття (ВАШ ${fvVAS}/10).`]:[]),...(cur.hasBK?[`Біль у куксі (ВАШ ${bkVAS}/10).`]:[]),"Порушення сну.","Підвищена дратівливість.","Тривожність.","Зниження концентрації уваги.","Пригніченість настрою.","Нав'язливі спогади про поранення.","Загальна слабкість, втомлюваність."];
+const anamnPhrases=[`Зі слів пацієнта: ампутація внаслідок бойового поранення${cur.injDate?" ("+cur.injDate+")":""}.`,...(ampStr2?[`Рівень ампутації: ${ampStr2}.`]:[]),...(cur.rpni?["Проведено RPNI під час ампутації."]:["RPNI не проводилось."]),"До поранення скарги на психічний стан відсутні.","Фантомні явища з'явились у перші дні після ампутації.","Звернення по психологічну допомогу — вперше.","Мотивація до реабілітації збережена."];
+const cognPhrases=[`Пам'ять суб'єктивно знижена на поточні події${mocaStr}.`,"Пам'ять у межах вікової норми.","Увага достатньо стійка.","Стійкість та концентрація уваги знижені (виснажуваність).","Мислення послідовне, цілеспрямоване, темп помірний.","Темп мислення дещо уповільнений.","Патологічної продукції (марення, нав'язливості) не виявлено.","Мова зв'язна, граматично правильна, темп помірний.","Інтелект відповідає рівню освіти."];
+const emotPhrases=["Емоційний фон дещо знижений.","Емоційний фон нестійкий.","Підвищена тривожність.","Фіксація на больових відчуттях.","Дратівливість підвищена.","Епізоди нав'язливих спогадів (флешбеки).","Уникнення нагадувань про травматичну подію.","Знижений інтерес до звичних занять.","Суїцидальних думок не виявлено.",...(emotScores?[`Підтверджено: ${emotScores}.`]:[])];
+const sleepPhrases=["Сон задовільний.",...(aisv!=null?[`Сон порушений. AIS: ${aisv}/24 (${iAIS(aisv).t}).`]:["Сон порушений."]),"Утруднене засинання.","Часті нічні пробудження.","Нічні кошмари (пов'язані з травматичною подією).","Суб'єктивно відчуває себе невідпочилим/ою після сну.","Сон поверхневий.","Сон суб'єктивно задовільний.","Тривалість сну менше 6 годин."];
+const painPhrases=[...(cur.hasFB?[`Фантомний біль: ВАШ ${fbVAS}/10.`]:[]),...(cur.hasFV?[`Фантомні відчуття: ВАШ ${fvVAS}/10.`]:[]),...(cur.hasBK?[`Біль у куксі: ВАШ ${bkVAS}/10.`]:[]),...(dn4v!=null?[`DN-4: ${dn4v}/10 (${iDN4(dn4v).t}).`]:[]),...((cur.stumpPath||[]).length>0?[`Патологія кукси: ${(cur.stumpPath||[]).join(", ")}.`]:[]),"Біль постійний.","Біль нападоподібний.","Посилення болю вночі.","Посилення болю при емоційному навантаженні."];
+const genesisPhrases=[...(gc.dominant!=="—"?[`Домінуючий генез: ${gc.dominant}.`]:[]),...(gc.peripheral>0?[`Периферичний генез: ${gc.peripheral} дескр.`]:[]),...(gc.cerebral>0?[`Церебральний генез: ${gc.cerebral} дескр.`]:[]),...(gc.spinal>0?[`Спінальний генез: ${gc.spinal} дескр.`]:[]),...(gc.psychogenic>0?[`Психогенний генез: ${gc.psychogenic} дескр.`]:[]),"Генез змішаний.","Переважає периферичний компонент.","Переважає психогенний компонент.","Переважає церебральний компонент."];
+const recsPhrases=["Психологічний супровід (КПТ).","Психологічний супровід (EMDR).","Психологічний супровід (Brainspotting).","Дзеркальна терапія.","Техніки релаксації та регуляції збудження.","Консультація психіатра (корекція сну).","Консультація психіатра (корекція тривоги).","Консультація алголога (больовий синдром).","Повторний огляд через 14 днів.","Повторний огляд через 30 днів.","Психоедукація щодо природи фантомного болю.","Групова психотерапія (ветеранська група)."];
+
+const buildFinal=()=>{
+  const blocks=[
+    cBlk.orient&&`Орієнтування / контакт: ${cBlk.orient.trim()}`,
+    cBlk.complaints&&`Скарги: ${cBlk.complaints.trim()}`,
+    cBlk.anamn&&cBlk.anamn.trim(),
+    cBlk.cogn&&`Пам'ять, увага, мислення: ${cBlk.cogn.trim()}`,
+    cBlk.emot&&`Емоційний фон: ${cBlk.emot.trim()}`,
+    cBlk.sleep&&`Сон: ${cBlk.sleep.trim()}`,
+    cBlk.pain&&`Больовий профіль: ${cBlk.pain.trim()}`,
+    cBlk.genesis&&`Генез больового синдрому: ${cBlk.genesis.trim()}`,
+    cBlk.recs&&`Рекомендації: ${cBlk.recs.trim()}`,
+  ].filter(Boolean);
+  const header=`Психологічний висновок від ${today}\nПацієнт: ${cur.name||"—"}, ${cur.age||"—"} р., ${cur.sex||"—"}\n${"─".repeat(40)}\n`;
+  return header+blocks.join("\n\n");
+};
+
+const handleGenerate=()=>{setCFinalText("");setTimeout(()=>{const t=buildFinal();setCFinalText(t);setCSaved(false);setCCopied(false);},0);};
+const handleCopy=()=>{navigator.clipboard.writeText(cFinalText).then(()=>{setCCopied(true);setTimeout(()=>setCCopied(false),2000)});};
+const handleSave=()=>{const updated={...cur,conclusion:cFinalText,recs:cBlk.recs};saveP(updated);go("detail");};
+const handlePrint=()=>{const w=window.open("","_blank");w.document.write(`<html><head><meta charset="UTF-8"><title>Заключення — ${cur.name||""}</title><style>body{font-family:Arial,sans-serif;font-size:13px;padding:30px;max-width:700px;margin:0 auto;line-height:1.7}pre{white-space:pre-wrap;font-family:inherit}</style></head><body><pre>${cFinalText}</pre></body></html>`);w.document.close();w.print();};
+
+return <div style={W}><div style={S.hdr}>
+  <button onClick={()=>go("detail")} style={{background:"none",border:"none",cursor:"pointer",color:"#c8a2ff",fontSize:20,padding:4}}>←</button>
+  <h2 style={{fontSize:16,fontWeight:700,flex:1}}>📝 Заключення</h2>
+  <div style={{fontSize:11,color:"#555"}}>{today}</div>
+</div>
+<div style={SC} ref={ref}><div style={{padding:"14px 16px 40px"}}>
+
+<div style={{...S.card,cursor:"default",marginBottom:14,padding:"10px 14px"}}>
+  <div style={{fontSize:13,fontWeight:700,color:"#c8a2ff"}}>{cur.name||"—"}</div>
+  <div style={{fontSize:12,color:"#666",marginTop:2}}>
+    {cur.age&&<span>{cur.age} р., {cur.sex} • </span>}
+    {ampStr2&&<span>{ampStr2} • </span>}
+    {gc.dominant!=="—"&&<span>Генез: {gc.dominant}</span>}
+  </div>
+  {la?<div style={{fontSize:11,color:"#555",marginTop:4}}>
+    Опитування: {la.date}
+    {pcl5v!=null&&<span style={{color:iPCL5(pcl5v).c}}> | PCL-5:{pcl5v}</span>}
+    {hadsTv!=null&&<span style={{color:iHADS(hadsTv,hadsDv??0).t.c}}> | Т:{hadsTv}</span>}
+    {hadsDv!=null&&<span style={{color:iHADS(hadsTv??0,hadsDv).d.c}}> | Д:{hadsDv}</span>}
+    {aisv!=null&&<span style={{color:iAIS(aisv).c}}> | AIS:{aisv}</span>}
+    {dn4v!=null&&<span style={{color:iDN4(dn4v).c}}> | DN4:{dn4v}</span>}
+  </div>:<div style={{fontSize:11,color:"#e76f51",marginTop:4}}>⚠ Немає опитувань — частина даних відсутня</div>}
+</div>
+
+<BlkSect title="1. Орієнтування / контакт" phrases={orientPhrases} value={cBlk.orient} onChange={v=>cUpd("orient",v)}/>
+<BlkSect title="2. Скарги" phrases={complaintPhrases} value={cBlk.complaints} onChange={v=>cUpd("complaints",v)}/>
+<BlkSect title="3. Зі слів пацієнта (анамнез)" phrases={anamnPhrases} value={cBlk.anamn} onChange={v=>cUpd("anamn",v)}/>
+<BlkSect title="4. Пам'ять, увага, мислення, мова" phrases={cognPhrases} value={cBlk.cogn} onChange={v=>cUpd("cogn",v)}/>
+<BlkSect title="5. Емоційний фон + опитувальники" phrases={emotPhrases} value={cBlk.emot} onChange={v=>cUpd("emot",v)}/>
+<BlkSect title="6. Сон (AIS)" phrases={sleepPhrases} value={cBlk.sleep} onChange={v=>cUpd("sleep",v)}/>
+<BlkSect title="7. Больовий профіль (VAS / DN-4)" phrases={painPhrases} value={cBlk.pain} onChange={v=>cUpd("pain",v)}/>
+<BlkSect title="8. Генез больового синдрому" phrases={genesisPhrases} value={cBlk.genesis} onChange={v=>cUpd("genesis",v)}/>
+<BlkSect title="9. Рекомендації" phrases={recsPhrases} value={cBlk.recs} onChange={v=>cUpd("recs",v)}/>
+
+<button onClick={handleGenerate} style={{width:"100%",padding:"13px",borderRadius:12,border:"none",background:"linear-gradient(135deg,#c8a2ff,#8b5cf6)",color:"#fff",fontWeight:700,fontSize:15,cursor:"pointer",marginBottom:16}}>
+  ✦ Сформувати заключення
+</button>
+
+{cFinalText&&<div style={{marginBottom:16}}>
+  <div style={{fontSize:11,fontWeight:700,color:"#666",marginBottom:8,textTransform:"uppercase",letterSpacing:"0.05em"}}>Готовий текст</div>
+  <textarea value={cFinalText} onChange={e=>setCFinalText(e.target.value)}
+    style={{width:"100%",minHeight:220,padding:"12px",background:"#1a1c24",border:"1px solid #2e3038",borderRadius:10,color:"#e8e9ed",fontSize:12,resize:"vertical",outline:"none",fontFamily:"inherit",lineHeight:1.7,boxSizing:"border-box"}}
+    onFocus={e=>e.target.style.borderColor="#c8a2ff"} onBlur={e=>e.target.style.borderColor="#2e3038"}
+  />
+  <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginTop:10}}>
+    <button onClick={handleCopy} style={{padding:"11px",borderRadius:10,border:"1px solid #2e3038",background:cCopied?"rgba(42,157,143,0.2)":"#1a1c24",color:cCopied?"#2a9d8f":"#c8a2ff",fontWeight:600,fontSize:13,cursor:"pointer"}}>
+      {cCopied?"✓ Скопійовано":"📋 Копіювати"}
+    </button>
+    <button onClick={handleSave} style={{padding:"11px",borderRadius:10,border:"1px solid #2e3038",background:cSaved?"rgba(42,157,143,0.2)":"#1a1c24",color:cSaved?"#2a9d8f":"#e9c46a",fontWeight:600,fontSize:13,cursor:"pointer"}}>
+      {cSaved?"✓ Збережено":"💾 Зберегти"}
+    </button>
+    <button onClick={handlePrint} style={{padding:"11px",borderRadius:10,border:"1px solid #2e3038",background:"#1a1c24",color:"#8a8f98",fontWeight:600,fontSize:13,cursor:"pointer"}}>
+      🖨 Друк
+    </button>
+    <button onClick={()=>exportWordDoc(cur,asms,cFinalText)} style={{padding:"11px",borderRadius:10,border:"1px solid rgba(42,157,143,0.4)",background:"rgba(42,157,143,0.08)",color:"#2a9d8f",fontWeight:600,fontSize:13,cursor:"pointer"}}>
+      📄 Word
+    </button>
+  </div>
+</div>}
+
+</div></div></div>}
+return null;
+}
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script>
+</body>
+</html>
